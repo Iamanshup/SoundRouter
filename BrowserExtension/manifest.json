@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "SoundRouter Tabs",
+  "version": "1.1",
+  "description": "Play a single tab's audio on any speaker, using the SoundRouter Mac app.",
+  "permissions": ["tabCapture", "tabs", "offscreen", "activeTab"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "SoundRouter: choose a speaker for this tab" },
+  "commands": {
+    "_execute_action": { "suggested_key": { "default": "Alt+Shift+S" } }
+  },
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+}

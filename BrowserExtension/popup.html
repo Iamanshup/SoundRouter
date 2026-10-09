@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7; --card: #ffffff; --line: rgba(0,0,0,.08); --text: #1d1d1f; --muted: #6e6e73;
+    --accent: #2f6fde; --hover: rgba(0,0,0,.04); --warn: #c4561d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #232326; --card: #2e2e32; --line: rgba(255,255,255,.08); --text: #f5f5f7; --muted: #a1a1a6;
+            --accent: #5b9bff; --hover: rgba(255,255,255,.05); --warn: #ff9f5a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; width: 320px; background: var(--bg); color: var(--text);
+         font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+  header { display: flex; align-items: center; gap: 10px; padding: 14px 14px 10px; }
+  header img.logo { width: 28px; height: 28px; border-radius: 7px; }
+  header .titles { min-width: 0; }
+  header h1 { font-size: 13px; font-weight: 600; margin: 0; }
+  #tab { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; margin-top: 2px; min-width: 0; }
+  #tab img { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+  #tab span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .section { margin: 0 10px 10px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .section-title { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+                   padding: 10px 12px 4px; }
+  label.opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; position: relative; }
+  label.opt:hover { background: var(--hover); }
+  label.opt + label.opt { border-top: 1px solid var(--line); }
+  label.opt input { position: absolute; opacity: 0; pointer-events: none; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent); background: var(--c); }
+  .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { font-size: 9px; font-weight: 600; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
+         padding: 2px 6px; border-radius: 99px; flex: none; }
+  .sub { font-size: 11px; color: var(--muted); flex: none; }
+  .check { width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--line); flex: none; display: grid; place-items: center; }
+  label.opt.selected { background: color-mix(in srgb, var(--c) 12%, transparent); }
+  label.opt.selected .check { background: var(--c); border-color: var(--c); }
+  label.opt.selected .check::after { content: ""; width: 5px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: translateY(-1px) rotate(45deg); }
+
+  #volume { display: none; align-items: center; gap: 10px; padding: 10px 12px 12px; }
+  #volume svg { width: 16px; height: 16px; flex: none; fill: var(--muted); }
+  #vol { flex: 1; accent-color: var(--vc, var(--accent)); }
+  #volText { width: 34px; text-align: right; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  #msg { display: flex; gap: 8px; align-items: flex-start; padding: 0 16px 14px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+  #msg::before { content: ""; width: 7px; height: 7px; border-radius: 50%; margin-top: 4px; flex: none; background: var(--muted); }
+  #msg.live::before { background: #30d158; box-shadow: 0 0 0 3px rgba(48,209,88,.2); }
+  #msg.error { color: var(--warn); }
+  #msg.error::before { background: var(--warn); }
+  #msg:empty { display: none; }
+</style>
+</head>
+<body>
+  <header>
+    <img class="logo" src="icon48.png" alt="">
+    <div class="titles">
+      <h1>Play this tab on…</h1>
+      <div id="tab"></div>
+    </div>
+  </header>
+  <div class="section" id="speakers">
+    <div class="section-title">Speaker</div>
+    <div id="list"></div>
+  </div>
+  <div class="section" id="volumeSection" style="display:none">
+    <div id="volume">
+      <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 4V5L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+      <input id="vol" type="range" min="0" max="100">
+      <span id="volText"></span>
+    </div>
+  </div>
+  <div id="msg"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

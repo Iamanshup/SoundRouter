@@ -1,0 +1,30 @@
+# Swift Package Manager / build output
+.build/
+build/
+.swiftpm/
+Package.resolved
+
+# Xcode (if the package is opened in Xcode)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# Node (test dependencies, installed with `npm i puppeteer`)
+node_modules/
+package-lock.json
+package.json
+
+# Chrome for Testing downloads
+browsers/
+
+# Icon intermediates (AppIcon.icns and icon-1024.png are kept)
+Icon/*.iconset/
+
+# Test output and helpers
+*.log
+Tests/setrate
+
+# macOS
+.DS_Store
+._*
