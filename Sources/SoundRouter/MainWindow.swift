@@ -13,12 +13,13 @@ struct MainView: View {
                     Label(section.title, systemImage: section.symbol).tag(section)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .navigationSplitViewColumnWidth(min: 210, ideal: 220, max: 260)
         } detail: {
             switch ui.section ?? .apps {
             case .apps: AppsPage()
             case .speakers: SpeakersPage()
             case .microphones: MicrophonesPage()
+            case .presets: PresetsPage()
             case .settings: SettingsPage()
             }
         }
@@ -86,6 +87,32 @@ struct AppsPage: View {
                         }
                     }
                 }
+                if !model.siteRules.isEmpty {
+                    Section {
+                        ForEach(model.siteRules.keys.sorted(), id: \.self) { host in
+                            let rule = model.siteRules[host]!
+                            HStack(spacing: 8) {
+                                Image(systemName: "globe").foregroundStyle(.secondary)
+                                Text(host)
+                                Spacer()
+                                Chip(title: model.chipTitle(rule.deviceUID, extras: rule.extraDeviceUIDs, follow: ""),
+                                     color: model.color(for: rule.deviceUID), help: "Speaker for \(host)", maxTextWidth: 170) {
+                                    model.devices.map { d in
+                                        ClosureMenuItem(d.name, image: Theme.dot(model.nsColor(for: d.uid)), checked: d.uid == rule.deviceUID) {
+                                            model.setSiteDevice(d.uid, for: host)
+                                        }
+                                    }
+                                }
+                                Button("Forget") { model.forgetSite(host) }
+                            }
+                        }
+                    } header: {
+                        Text("Remembered Websites")
+                    } footer: {
+                        Text("When you click the SoundRouter button on one of these sites, its tab goes straight to the remembered speaker.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
                 if model.browserConnections.isEmpty {
                     Section("Browser Tabs") { ExtensionSetup() }
                 }
@@ -104,7 +131,10 @@ struct SpeakersPage: View {
             Form {
                 Section {
                     ForEach(model.devices) { SpeakerRow(device: $0).padding(.vertical, 3) }
+                } footer: {
+                    Text("Expand a speaker for balance and sync delay.").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
+                Section { AlertsRow() }
             }
             .formStyle(.grouped)
         }
@@ -140,7 +170,20 @@ struct SettingsPage: View {
                     Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
                     Toggle("Show background processes in the app list", isOn: $model.showBackgroundProcesses)
                 }
-                Section("Browser Tabs") { ExtensionSetup() }
+                Section("Keyboard Shortcuts") {
+                    Toggle("Enable keyboard shortcuts", isOn: $model.shortcutsEnabled)
+                    if model.shortcutsEnabled {
+                        ShortcutRow(keys: "S", title: "Switch the Mac default speaker")
+                        ShortcutRow(keys: "M", title: "Mute or unmute the app in front")
+                        ShortcutRow(keys: "↑ / ↓", title: "Louder / quieter: the app in front (up to 200%)")
+                        ShortcutRow(keys: "1 – 9", title: "Apply preset 1 to 9")
+                        ShortcutRow(keys: "0", title: "Open the SoundRouter panel")
+                    }
+                }
+                Section("Browser Tabs") {
+                    ExtensionSetup()
+                    Toggle("Remember the speaker for each website", isOn: $model.rememberSites)
+                }
                 Section {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -198,5 +241,165 @@ struct ExtensionSetup: View {
                 .frame(width: 16, height: 16).background(Circle().fill(Color.accentColor))
             Text(text).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+struct ShortcutRow: View {
+    let keys: String
+    let title: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(HotKeys.modifierLabel + keys)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.07)))
+        }
+    }
+}
+
+struct PresetsPage: View {
+    @EnvironmentObject var model: AudioModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageHeader(title: "Presets & Automation", subtitle: "Save setups, switch with one click or a shortcut, and let speakers trigger them.")
+            Form {
+                Section {
+                    if model.presets.isEmpty {
+                        Text("No presets yet. Set things up the way you like, then save it.").foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(model.presets.enumerated()), id: \.element.id) { index, preset in
+                        PresetRow(preset: preset, index: index)
+                    }
+                    Button("Save Current Setup as Preset…") { promptSavePreset(model) }
+                } header: {
+                    Text("Presets")
+                } footer: {
+                    Text("A preset stores every app’s speaker, volume and balance, the Mac default speaker and the alerts speaker.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Section {
+                    if model.automations.isEmpty {
+                        Text("No automations yet.").foregroundStyle(.secondary)
+                    }
+                    ForEach(model.automations) { AutomationRow(automation: $0) }
+                    Button("Add Automation") {
+                        let uid = model.devices.first(where: { !$0.isDefault })?.uid ?? model.devices.first?.uid ?? ""
+                        model.addAutomation(Automation(deviceUID: uid, deviceName: model.deviceName(uid),
+                                                       makeDefault: true, presetID: model.presets.first?.id))
+                    }
+                    .disabled(model.knownDevices.isEmpty)
+                } header: {
+                    Text("Automation")
+                } footer: {
+                    Text("Apps already set to a speaker switch to it by themselves whenever it connects, and back to the Mac default when it disconnects. Use automations to change more than that.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+        }
+    }
+}
+
+struct PresetRow: View {
+    @EnvironmentObject var model: AudioModel
+    let preset: Preset
+    let index: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(index < 9 ? "\(index + 1)" : "")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Color.primary.opacity(0.07)))
+                .help(index < 9 ? "Shortcut: \(HotKeys.modifierLabel)\(index + 1)" : "")
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(preset.name).font(.system(size: 13, weight: .medium))
+                    if model.activePresetID == preset.id { Badge(text: "Active") }
+                }
+                Text(summary).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Button("Apply") { model.applyPreset(preset.id) }
+            Menu {
+                PresetMenuItems(preset: preset)
+                Divider()
+                Button("Move Up") { model.movePreset(preset.id, by: -1) }.disabled(index == 0)
+                Button("Move Down") { model.movePreset(preset.id, by: 1) }.disabled(index == model.presets.count - 1)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+    }
+
+    private var summary: String {
+        var parts = ["\(preset.rules.count) app\(preset.rules.count == 1 ? "" : "s")"]
+        if let uid = preset.defaultUID { parts.append("Mac default: \(model.deviceName(uid))") }
+        if preset.alerts != "" && preset.alerts != "default" { parts.append("Alerts: \(model.deviceName(preset.alerts))") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+struct AutomationRow: View {
+    @EnvironmentObject var model: AudioModel
+    let automation: Automation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("When")
+                Picker("", selection: binding(\.deviceUID)) {
+                    ForEach(model.knownDevices.sorted { $0.value < $1.value }, id: \.key) { uid, name in
+                        Text(name).tag(uid)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                Picker("", selection: binding(\.onConnect)) {
+                    Text("connects").tag(true)
+                    Text("disconnects").tag(false)
+                }
+                .labelsHidden()
+                .fixedSize()
+                Spacer()
+                Button { model.deleteAutomation(automation.id) } label: { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .help("Delete automation")
+            }
+            HStack(spacing: 16) {
+                if automation.onConnect {
+                    Toggle("Make it the Mac default", isOn: binding(\.makeDefault))
+                }
+                HStack(spacing: 6) {
+                    Text("Apply preset")
+                    Picker("", selection: binding(\.presetID)) {
+                        Text("None").tag(UUID?.none)
+                        ForEach(model.presets) { Text($0.name).tag(UUID?.some($0.id)) }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+            }
+            .font(.system(size: 12))
+            .padding(.leading, 2)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func binding<T>(_ path: WritableKeyPath<Automation, T>) -> Binding<T> {
+        Binding(get: { automation[keyPath: path] }, set: { value in
+            var updated = automation
+            updated[keyPath: path] = value
+            updated.deviceName = model.deviceName(updated.deviceUID)
+            model.updateAutomation(updated)
+        })
     }
 }

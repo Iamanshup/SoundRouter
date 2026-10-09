@@ -8,7 +8,13 @@ A macOS menu bar app that sends each app's sound, or even a single browser tab, 
 
 - **Per-app speaker:** route any app to any connected output (built-in, Bluetooth, AirPlay, USB, HDMI). Apps you don't touch keep following the **Mac default** speaker.
 - **Per-tab speaker:** with the companion browser extension, route individual Chrome, Brave or Edge tabs. A tab can go to a different speaker from the rest of the browser.
-- **Volume everywhere:** a slider and mute for each speaker, each app and each routed tab. Speakers without a hardware volume (often HDMI) get a software volume.
+- **Several speakers at once:** play an app or tab on more than one speaker ("Also Play On"), with a per-speaker **sync delay** to line up Bluetooth speakers. Multi-output devices are played through the real speakers inside them, so nothing doubles up.
+- **Volume everywhere:** a slider and mute for each speaker, each app and each routed tab. Apps and tabs go up to **200%** with a limiter, and have **left/right balance**. Speakers without a hardware volume (often HDMI) get a software volume.
+- **Alert sounds on their own speaker:** send notifications and system sounds to, say, the MacBook speakers while music plays on headphones.
+- **Presets:** save a whole setup (every app's speaker, volume and balance, the Mac default and the alerts speaker) and switch with one click or a shortcut.
+- **Automation:** when a speaker connects or disconnects, make it the Mac default and/or apply a preset. Apps set to a speaker already move to it on their own whenever it connects.
+- **Keyboard shortcuts** (<kbd>⌃⌥⌘</kbd>): **S** switch the Mac default speaker, **M** mute the app in front, **↑/↓** louder/quieter for the app in front, **1–9** apply a preset, **0** open the panel. An on-screen notice confirms each one.
+- **Remembered websites:** a tab's speaker is remembered per site, so the next YouTube tab goes to the same speaker as soon as you click the extension.
 - **Microphones:** choose the Mac's mic, set input levels and mute.
 - **Keep headphones in high quality** (optional): if macOS switches the mic to Bluetooth headphones, which drops their playback to low-quality headset mode, SoundRouter switches it back to the Mac's mic.
 - **Remembers your choices** per app, and re-applies them when the app or speaker comes back.
@@ -32,6 +38,16 @@ This builds a release binary, assembles `build/SoundRouter.app` (icon, Info.plis
 ```sh
 open ~/Applications/SoundRouter.app
 ```
+
+Options: `UNIVERSAL=1` builds for both Apple Silicon and Intel; `INSTALL=0` builds without installing.
+
+### Make a DMG to share
+
+```sh
+./make-dmg.sh        # → dist/SoundRouter-<version>.dmg (universal app + Applications link + Read Me)
+```
+
+The app is signed ad hoc, not notarized (that needs a paid Apple Developer account). On another Mac, the first launch shows "Apple could not verify SoundRouter"; open **System Settings › Privacy & Security** and click **Open Anyway** once. The DMG's *Read Me First.txt* explains this.
 
 ### Permissions
 
@@ -71,6 +87,7 @@ The extension needs the app running. If the app quits, captured tabs are release
 
 - **Per-app routing** uses Core Audio *process taps* (`CATapDescription`, macOS 14.2+). For each routed app SoundRouter taps its processes, grouped by "responsible" app so that browser helpers belong to the browser. The tap mutes the app's normal output only while SoundRouter reads it, so audio comes back if SoundRouter quits. A private aggregate device pairs the tap with the target speaker, and an IOProc copies the audio across with gain applied.
 - **Per-tab routing:** the extension captures the tab with `chrome.tabCapture` (which silences it in the browser), resamples it in an `AudioContext` to the speaker's sample rate, and streams 10 ms chunks of float PCM to the app over a local WebSocket. The app plays them through a lock-free ring buffer with a small jitter buffer (about 60 ms). Only `chrome-extension://` origins can connect, so web pages can't.
+- **Several speakers:** each speaker gets its own tap/aggregate (apps) or player (tabs); a browser tab is streamed once and resampled for speakers running at a different rate. Speakers can be delayed individually to line up.
 - **Sample-rate changes:** each tab player watches its speaker's nominal sample rate. When it changes, the app rebuilds the player and the extension re-renders the same captured stream at the new rate, with no extra click needed.
 
 ## Project layout
@@ -80,7 +97,9 @@ Sources/SoundRouter/
   SoundRouterApp.swift      App entry, menu bar item and popover, main window, Dock behaviour
   AudioModel.swift          State and logic: rules, routing, tabs, mics, headphone guard, colours
   TapRouter.swift           Per-app routing (process tap → aggregate device → speaker)
-  TabPlayer.swift           Per-tab playback (ring buffer, jitter buffer, sample-rate watch)
+  TabPlayer.swift           Per-tab playback (ring buffer, jitter buffer, resampling, sample-rate watch)
+  AudioDSP.swift            Shared real-time processing: gain, balance, limiter, delay line
+  HotKeys.swift, HUD.swift  Global shortcuts and the on-screen notice
   BrowserBridge.swift       Local WebSocket server for the extension
   Devices.swift             Speakers and microphones: listing, volume, mute, defaults
   Processes.swift           Which apps are using audio, grouped by responsible app
@@ -94,6 +113,7 @@ BrowserExtension/           Chrome MV3 extension (background, offscreen capture,
 Icon/                       make-icon.swift renders the icon; AppIcon.icns is used by the build
 Tests/                      Integration tests (Node) and a sample-rate helper (Swift)
 build-app.sh                Build, bundle, sign and install
+make-dmg.sh                 Universal build packaged as a DMG
 ```
 
 ## Testing
@@ -106,6 +126,7 @@ Run against the installed app. Launch through `open` so that macOS attributes th
 |---|---|
 | `open -W -n ~/Applications/SoundRouter.app --args --selftest /tmp/self.log` | Devices, speaker volume, per-app routing (tap → speaker), app volume and mute, speaker sample-rate switches. Plays a short spoken clip. `SR_DEVICE=<name>` picks the target speaker. |
 | `open -W -n --env SR_SIMULATE_BT_HEADSET="<mic name>" ~/Applications/SoundRouter.app --args --mictest /tmp/mic.log` | Mic listing and levels, and the "keep headphones in high quality" setting, using the named mic as a stand-in headset. |
+| `open -W -n ~/Applications/SoundRouter.app --args --featuretest /tmp/feature.log` | Alerts speaker, presets, automations (by creating and removing a temporary virtual speaker), shortcuts, boost, balance, multi-speaker capture, multi-output devices, tab resampling. |
 | `…/SoundRouter --docktest /tmp/dock.log` | Closing the window hides the Dock icon; reopening from the menu bar restores it. |
 | `…/SoundRouter --menutest <dir>` | Opens the real menu bar panel and main window and saves light and dark screenshots. `SR_SECTION=apps\|speakers\|microphones\|settings`, `SR_EXPAND=<row id>`, `SR_LONG=1`. |
 
@@ -130,7 +151,8 @@ The sample-rate test switches the MacBook speakers between 48 kHz and 44.1 kHz a
 
 - Per-app *microphone* selection isn't supported. It would need a virtual audio driver. Call apps (Zoom, Meet, FaceTime) can pick their own mic.
 - Per-tab routing adds about 60 ms of latency (whole-app routing adds none), and needs one click on the extension per tab.
-- Tab routes aren't remembered across browser restarts. Tab IDs change.
+- Remembered websites need one click on the extension per tab (Chrome's rule); they then apply automatically.
+- Keyboard shortcuts are fixed (<kbd>⌃⌥⌘</kbd> + key) and can be turned off in Settings, but not reassigned.
 - Bluetooth headphones drop to headset quality whenever any app uses their mic. That's a Bluetooth limitation; the "keep headphones in high quality" setting helps avoid it.
 
 ## Troubleshooting

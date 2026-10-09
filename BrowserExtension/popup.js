@@ -8,6 +8,18 @@ const volText = document.getElementById('volText');
 let tab;
 let lastKey = '';
 let dragging = false;
+let autoApplied = false;
+const site = document.getElementById('site');
+const siteText = document.getElementById('siteText');
+
+function hostOf(url) {
+  try {
+    const h = new URL(url).hostname;
+    return h.startsWith('www.') ? h.slice(4) : h;
+  } catch (e) {
+    return '';
+  }
+}
 const NEUTRAL = '#8e8e93';
 
 function setMessage(text, kind = '') {
@@ -65,6 +77,21 @@ async function render() {
   speakers.style.display = '';
   const route = s.routes[String(tab.id)];
   const error = s.errors[String(tab.id)];
+  const host = hostOf(tab.url || '');
+  const remembered = host && s.sites ? s.sites[host] : null;
+  // A website with a remembered speaker: opening the popup is enough to send it there.
+  if (!route && remembered && !autoApplied && !error) {
+    autoApplied = true;
+    chooseRemembered();
+    return;
+  }
+  if (remembered) {
+    const device = s.devices.find((d) => d.uid === remembered.deviceUID);
+    siteText.textContent = `Remembered for ${host}` + (device ? ` · ${device.name}` : '');
+    site.style.display = 'flex';
+  } else {
+    site.style.display = 'none';
+  }
   const key = JSON.stringify([s.devices, route && route.deviceUID]);
   if (key !== lastKey) {
     lastKey = key;
@@ -84,13 +111,39 @@ async function render() {
     vol.style.setProperty('--vc', (device && device.color) || '');
     if (!dragging) {
       vol.value = Math.round(route.volume * 100);
-      volText.textContent = vol.value + '%';
+      showVolume();
     }
   }
   if (error) setMessage(error, 'error');
   else if (route) setMessage('This tab is playing through SoundRouter.', 'live');
   else setMessage('Tab audio follows the browser’s speaker.');
 }
+
+function showVolume() {
+  volText.textContent = vol.value + '%';
+  volText.className = vol.value > 100 ? 'boost' : '';
+}
+
+async function mintStreamId(s) {
+  if (s.captured.includes(tab.id)) return undefined;
+  return chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+}
+
+async function chooseRemembered() {
+  try {
+    const s = await state();
+    const streamId = await mintStreamId(s);
+    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'setRoute', tabId: tab.id, fromSite: true, streamId });
+  } catch (e) {
+    setMessage('Couldn’t capture this tab: ' + (e.message || e), 'error');
+  }
+  setTimeout(render, 150);
+}
+
+document.getElementById('forget').addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ target: 'offscreen', type: 'forgetSite', host: hostOf(tab.url || '') });
+  setTimeout(render, 150);
+});
 
 async function choose(deviceUID) {
   const s = await state();
@@ -110,7 +163,7 @@ async function choose(deviceUID) {
 
 vol.addEventListener('input', () => {
   dragging = true;
-  volText.textContent = vol.value + '%';
+  showVolume();
   chrome.runtime.sendMessage({ target: 'offscreen', type: 'setVolume', tabId: tab.id, volume: vol.value / 100 });
 });
 vol.addEventListener('change', () => { dragging = false; });

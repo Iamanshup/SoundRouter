@@ -49,6 +49,8 @@ check(!!route && route.sampleRate > 0, `app asks extension to capture tab 7 at $
 ws.send(JSON.stringify({ type: 'captured', tabId: 7 }));
 const st2 = await waitFor(inbox, (m) => m.type === 'state' && m.routes['7']);
 check(st2 && st2.routes['7'].deviceUID === dev.uid, 'state reports tab 7 routed to ' + dev.name);
+check(st2 && st2.sites && st2.sites['youtube.com'] && st2.sites['youtube.com'].deviceUID === dev.uid,
+  'the speaker is remembered for youtube.com');
 
 // 4. Stream a quiet 440 Hz tone for 2 s in 10 ms chunks (amplitude 0.2).
 const rate = route.sampleRate, frames = Math.round(rate / 100);
@@ -86,9 +88,27 @@ ws.send(JSON.stringify({ type: 'debugStats', tabId: 7 }));
 const stats2 = await waitFor(inbox, (m) => m.type === 'debugStats');
 check(stats2 && Math.abs(stats2.peak - 0.1) < 0.02, `50% tab volume halves the level (peak ${stats2 && stats2.peak.toFixed(3)})`);
 
-// 6. Back to "Same as browser" releases the capture.
+// 5b. Another YouTube tab picks up the remembered speaker and volume (popup sends fromSite).
+ws.send(JSON.stringify({ type: 'tabs', tabs: [
+  { id: 7, title: 'YouTube - test video', url: 'https://www.youtube.com/watch?v=x', audible: true },
+  { id: 8, title: 'Docs', url: 'https://example.com', audible: false },
+  { id: 9, title: 'YouTube - another video', url: 'https://www.youtube.com/watch?v=y', audible: true },
+] }));
+await sleep(200);
+ws.send(JSON.stringify({ type: 'setRoute', tabId: 9, fromSite: true }));
+const r9 = await waitFor(inbox, (m) => m.type === 'route' && m.tabId === 9);
+const st9 = await waitFor(inbox, (m) => m.type === 'state' && m.routes['9']);
+check(!!r9 && st9 && st9.routes['9'].deviceUID === dev.uid && st9.routes['9'].volume === 0.5,
+  'a second youtube.com tab gets the remembered speaker and volume');
+ws.send(JSON.stringify({ type: 'captured', tabId: 9 }));
+ws.send(JSON.stringify({ type: 'setRoute', tabId: 9, deviceUID: null }));
+await waitFor(inbox, (m) => m.type === 'unroute' && m.tabId === 9);
+
+// 6. Back to "Same as browser" releases the capture and forgets the site.
 ws.send(JSON.stringify({ type: 'setRoute', tabId: 7, deviceUID: null }));
 check(!!(await waitFor(inbox, (m) => m.type === 'unroute' && m.tabId === 7)), 'choosing "Same as browser" tells the extension to stop capturing');
+const st6 = await waitFor(inbox, (m) => m.type === 'state' && !m.routes['7']);
+check(st6 && !st6.sites['youtube.com'], '…and forgets the remembered speaker for youtube.com');
 
 // 7. Capture failure surfaces a helpful message.
 ws.send(JSON.stringify({ type: 'setRoute', tabId: 8, deviceUID: dev.uid }));
@@ -97,6 +117,10 @@ ws.send(JSON.stringify({ type: 'captureFailed', tabId: 8, reason: 'Extension has
 const st4 = await waitFor(inbox, (m) => m.type === 'state' && m.errors['8']);
 check(st4 && !st4.routes['8'] && /Click the SoundRouter extension/.test(st4.errors['8']), 'needs-click error is shown and route cleared');
 
+// Leave no remembered test sites behind.
+ws.send(JSON.stringify({ type: 'forgetSite', host: 'example.com' }));
+ws.send(JSON.stringify({ type: 'forgetSite', host: 'youtube.com' }));
+await sleep(300);
 ws.close();
 console.log(failures ? `${failures} FAILURE(S)` : 'ALL PASSED');
 process.exit(failures ? 1 : 0);

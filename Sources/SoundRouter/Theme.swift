@@ -185,11 +185,12 @@ struct PlayingIndicator: View {
     }
 }
 
-/// Mute button + slider + percentage.
+/// Mute button + slider + percentage. With `boost`, goes to 200% (with a limiter).
 struct VolumeControl: View {
     let value: Float
     let muted: Bool
     var enabled = true
+    var boost = false
     var mutedSymbol = "speaker.slash.fill"
     var symbol = "speaker.wave.2.fill"
     var showPercent = true
@@ -199,27 +200,69 @@ struct VolumeControl: View {
     var body: some View {
         HStack(spacing: 6) {
             Button { toggleMute?() } label: {
-                Image(systemName: muted ? mutedSymbol : symbol)
+                Image(systemName: muted ? mutedSymbol : (value > 1 ? "speaker.wave.3.fill" : symbol))
                     .font(.system(size: 10))
-                    .foregroundStyle(muted ? Color.red : Color.secondary)
+                    .foregroundStyle(muted ? Color.red : (value > 1 ? Color.orange : Color.secondary))
                     .frame(width: 16)
             }
             .buttonStyle(.plain)
             .disabled(toggleMute == nil)
             .help(muted ? "Unmute" : "Mute")
-            Slider(value: Binding(get: { Double(value) }, set: { setValue(Float($0)) }), in: 0...1)
-                .labelsHidden()
-                .frame(maxWidth: .infinity)
-                .controlSize(.small)
-                .disabled(!enabled)
-                .opacity(muted ? 0.5 : 1)
+            ZStack {
+                Slider(value: Binding(get: { Double(value) }, set: { setValue(snap(Float($0))) }),
+                       in: 0...(boost ? 2 : 1))
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .tint(value > 1 ? .orange : nil)
+                if boost {
+                    // Tick at 100%.
+                    GeometryReader { geo in
+                        Rectangle().fill(Color.secondary.opacity(0.5))
+                            .frame(width: 1, height: 6)
+                            .position(x: geo.size.width / 2, y: geo.size.height / 2 + 7)
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .disabled(!enabled)
+            .opacity(muted ? 0.5 : 1)
+            .help(boost ? "Up to 200%. Above 100% a limiter prevents distortion." : "")
             if showPercent {
                 Text("\(Int((value * 100).rounded()))%")
                     .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 30, alignment: .trailing)
+                    .foregroundStyle(value > 1 ? Color.orange : Color.secondary)
+                    .frame(width: 32, alignment: .trailing)
             }
         }
+    }
+
+    /// Makes 100% easy to hit when boosting.
+    private func snap(_ v: Float) -> Float { boost && abs(v - 1) < 0.04 ? 1 : v }
+}
+
+/// Left/right balance, -1 … +1, snapping to the centre.
+struct BalanceControl: View {
+    let value: Float
+    let setValue: (Float) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("L").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).frame(width: 16)
+            Slider(value: Binding(get: { Double(value) }, set: { v in setValue(abs(Float(v)) < 0.06 ? 0 : Float(v)) }), in: -1...1)
+                .labelsHidden()
+                .controlSize(.mini)
+                .frame(maxWidth: .infinity)
+            Text("R").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            Text(label).font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 32, alignment: .trailing)
+        }
+        .help("Balance")
+    }
+
+    private var label: String {
+        if abs(value) < 0.01 { return "C" }
+        return (value < 0 ? "L" : "R") + "\(Int((abs(value) * 100).rounded()))"
     }
 }
 
@@ -236,13 +279,14 @@ final class UIState: ObservableObject {
 }
 
 enum SidebarSection: String, CaseIterable, Identifiable {
-    case apps, speakers, microphones, settings
+    case apps, speakers, microphones, presets, settings
     var id: String { rawValue }
     var title: String {
         switch self {
         case .apps: return "Apps & Tabs"
         case .speakers: return "Speakers"
         case .microphones: return "Microphones"
+        case .presets: return "Presets & Automation"
         case .settings: return "Settings"
         }
     }
@@ -251,6 +295,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         case .apps: return "square.grid.2x2"
         case .speakers: return "hifispeaker.2"
         case .microphones: return "mic"
+        case .presets: return "square.stack.3d.up"
         case .settings: return "gearshape"
         }
     }
@@ -263,5 +308,115 @@ extension EnvironmentValues {
     var roomy: Bool {
         get { self[RoomyKey.self] }
         set { self[RoomyKey.self] = newValue }
+    }
+}
+
+/// Lays children out left to right, wrapping onto new lines.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, maxX: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > width { x = 0; y += rowHeight + spacing; rowHeight = 0 }
+            x += size.width + spacing
+            maxX = max(maxX, x - spacing)
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: proposal.width ?? maxX, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX { x = bounds.minX; y += rowHeight + spacing; rowHeight = 0 }
+            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+@MainActor
+enum Prompt {
+    /// Asks for a line of text (e.g. a preset name). nil if cancelled.
+    static func text(_ title: String, message: String, initial: String = "", button: String = "Save") -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: initial)
+        field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate()
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    static func confirm(_ title: String, message: String, button: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+}
+
+/// Clickable preset pill; right-click for more.
+struct PresetPill: View {
+    @EnvironmentObject var model: AudioModel
+    let preset: Preset
+    let index: Int
+
+    var body: some View {
+        let active = model.activePresetID == preset.id
+        Button { model.applyPreset(preset.id) } label: {
+            HStack(spacing: 5) {
+                if active { Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)) }
+                Text(preset.name).lineLimit(1)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .foregroundStyle(active ? Color.white : Color.primary)
+            .background(Capsule().fill(active ? Color.accentColor : Color.primary.opacity(0.07)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(index < 9 ? "Apply (\(HotKeys.modifierLabel)\(index + 1)). Right-click for more." : "Apply. Right-click for more.")
+        .contextMenu { PresetMenuItems(preset: preset) }
+    }
+}
+
+struct PresetMenuItems: View {
+    @EnvironmentObject var model: AudioModel
+    let preset: Preset
+
+    var body: some View {
+        Button("Apply") { model.applyPreset(preset.id) }
+        Button("Update with Current Setup") { model.updatePreset(preset.id) }
+        Button("Rename…") {
+            if let name = Prompt.text("Rename Preset", message: "", initial: preset.name, button: "Rename") {
+                model.renamePreset(preset.id, to: name)
+            }
+        }
+        Divider()
+        Button("Delete", role: .destructive) { model.deletePreset(preset.id) }
+    }
+}
+
+@MainActor
+func promptSavePreset(_ model: AudioModel) {
+    if let name = Prompt.text("Save Preset",
+                              message: "Saves every app’s speaker and volume, the Mac default speaker and the alerts speaker.",
+                              initial: "Preset \(model.presets.count + 1)") {
+        model.savePreset(named: name)
     }
 }

@@ -28,3 +28,6 @@ Tests/setrate
 # macOS
 .DS_Store
 ._*
+
+# Release packages
+dist/

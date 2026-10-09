@@ -4,8 +4,10 @@ import SwiftUI
 // MARK: - Speaker menus
 
 extension AudioModel {
-    /// Menu for an app's or tab's speaker chip.
-    func speakerMenu(selected: String?, followTitle: String, onSelect: @escaping (String?) -> Void) -> [NSMenuItem] {
+    /// Menu for an app's or tab's speaker chip: one main speaker, plus "Also play on".
+    func speakerMenu(selected: String?, extras: [String] = [], followTitle: String,
+                     onSelect: @escaping (String?) -> Void,
+                     onToggleExtra: ((String) -> Void)? = nil) -> [NSMenuItem] {
         var items: [NSMenuItem] = [
             ClosureMenuItem(followTitle, image: Theme.dot(Theme.neutral), checked: selected == nil) { onSelect(nil) },
             .separator(),
@@ -16,13 +18,27 @@ extension AudioModel {
                 onSelect(device.uid)
             })
         }
+        if let onToggleExtra, devices.count > 1 {
+            let main = selected ?? defaultDevice?.uid
+            let submenu = NSMenu()
+            for device in devices where device.uid != main {
+                submenu.addItem(ClosureMenuItem(device.name, image: Theme.dot(nsColor(for: device.uid)),
+                                                checked: extras.contains(device.uid)) { onToggleExtra(device.uid) })
+            }
+            let parent = NSMenuItem(title: "Also Play On", action: nil, keyEquivalent: "")
+            parent.image = NSImage(systemSymbolName: "plus.square.on.square", accessibilityDescription: nil)
+            parent.submenu = submenu
+            items.append(.separator())
+            items.append(parent)
+        }
         return items
     }
 
-    /// Chip label: the chosen speaker's name, or the "follow" label.
-    func chipTitle(_ uid: String?, follow: String) -> String {
-        guard let uid else { return follow }
-        return devices.first { $0.uid == uid }?.name ?? "Disconnected"
+    /// Chip label: the chosen speaker's name (+ N more), or the "follow" label.
+    func chipTitle(_ uid: String?, extras: [String] = [], follow: String) -> String {
+        let base = uid.map { deviceName($0) } ?? follow
+        let more = extras.filter { device($0) != nil && $0 != uid }.count
+        return more > 0 ? "\(base) +\(more)" : base
     }
 }
 
@@ -30,10 +46,13 @@ extension AudioModel {
 
 struct SpeakerRow: View {
     @EnvironmentObject var model: AudioModel
+    @EnvironmentObject var ui: UIState
     let device: OutputDevice
 
     var body: some View {
         let color = model.color(for: device.uid)
+        let key = "spk:" + device.uid
+        let expanded = ui.expanded.contains(key)
         HStack(alignment: .top, spacing: 10) {
             IconBubble(symbol: device.symbol, color: color)
             VStack(alignment: .leading, spacing: 5) {
@@ -48,8 +67,9 @@ struct SpeakerRow: View {
                             .foregroundStyle(Color.accentColor)
                             .help("Make this the speaker macOS uses for everything without its own setting")
                     }
+                    ExpandButton(expanded: expanded) { ui.toggle(key) }
                 }
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
                     VolumeControl(value: device.volume, muted: device.muted,
                                   setValue: { model.setVolume($0, for: device) },
                                   toggleMute: { model.toggleMute(for: device) })
@@ -57,7 +77,67 @@ struct SpeakerRow: View {
                         Text("Software volume (applies to apps routed here)")
                             .font(.system(size: 9)).foregroundStyle(.tertiary)
                     }
+                    if expanded {
+                        if let balance = device.balance {
+                            BalanceControl(value: balance * 2 - 1) { model.setBalance(($0 + 1) / 2, for: device) }
+                        }
+                        DelayControl(ms: model.delay(for: device.uid)) { model.setDelay($0, for: device) }
+                    }
                 }
+            }
+        }
+    }
+}
+
+/// Delay for lining up speakers when one sound plays on several at once.
+struct DelayControl: View {
+    let ms: Float
+    let setValue: (Float) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Image(systemName: "timer").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 16)
+                Slider(value: Binding(get: { Double(ms) }, set: { setValue(Float(($0 / 10).rounded() * 10)) }), in: 0...500)
+                    .labelsHidden().controlSize(.mini)
+                    .frame(maxWidth: .infinity)
+                Text("\(Int(ms)) ms").font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(width: 44, alignment: .trailing)
+            }
+            Text("Sync delay: holds this speaker back when a sound plays on several speakers, so they line up.")
+                .font(.system(size: 9)).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 22)
+        }
+    }
+}
+
+/// Where alert and notification sounds play.
+struct AlertsRow: View {
+    @EnvironmentObject var model: AudioModel
+
+    var body: some View {
+        let current = model.alertsDevice
+        let following = model.alertsSetting == "default" || (model.alertsSetting.isEmpty && current?.isDefault == true)
+        HStack(spacing: 10) {
+            IconBubble(symbol: "bell.fill", color: .secondary, size: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Alerts & sound effects").font(.system(size: 12, weight: .medium))
+                Text("Notifications, system sounds").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Chip(title: following ? "Mac default" : (current?.name ?? "Mac default"),
+                 color: following ? Color(nsColor: Theme.neutral) : model.color(for: current?.uid),
+                 help: "Where alerts and notification sounds play") {
+                var items: [NSMenuItem] = [
+                    ClosureMenuItem("Same as Mac default", image: Theme.dot(Theme.neutral), checked: following) { model.setAlertsDevice(nil) },
+                    .separator(),
+                ]
+                for device in model.devices {
+                    items.append(ClosureMenuItem(device.name, image: Theme.dot(model.nsColor(for: device.uid)),
+                                                 checked: !following && current?.uid == device.uid) { model.setAlertsDevice(device.uid) })
+                }
+                return items
             }
         }
     }
@@ -98,22 +178,25 @@ struct AppRowView: View {
                 } else if app.isPlaying {
                     PlayingIndicator()
                 }
-                Chip(title: model.chipTitle(rule.deviceUID, follow: "Mac default"),
+                Chip(title: model.chipTitle(rule.deviceUID, extras: rule.extras, follow: "Mac default"),
                      color: model.color(for: rule.deviceUID),
                      help: "Speaker for \(app.name)", maxTextWidth: roomy ? 170 : 120) {
-                    model.speakerMenu(selected: rule.deviceUID,
-                                      followTitle: "Mac default (\(model.defaultDevice?.name ?? "system output"))") {
-                        model.setDevice($0, for: app)
-                    }
+                    model.speakerMenu(selected: rule.deviceUID, extras: rule.extras,
+                                      followTitle: "Mac default (\(model.defaultDevice?.name ?? "system output"))",
+                                      onSelect: { model.setDevice($0, for: app) },
+                                      onToggleExtra: { model.toggleExtraDevice($0, for: app) })
                 }
                 ExpandButton(expanded: expanded) { ui.toggle(app.id) }
             }
             .contentShape(Rectangle())
             if expanded {
-                VolumeControl(value: rule.volume, muted: rule.muted,
-                              setValue: { model.setVolume($0, for: app) },
-                              toggleMute: { model.toggleMute(for: app) })
-                    .padding(.leading, 31)
+                VStack(spacing: 4) {
+                    VolumeControl(value: rule.volume, muted: rule.muted, boost: true,
+                                  setValue: { model.setVolume($0, for: app) },
+                                  toggleMute: { model.toggleMute(for: app) })
+                    BalanceControl(value: rule.pan) { model.setBalance($0, for: app) }
+                }
+                .padding(.leading, 31)
             }
             if let error = model.routeErrors[app.id] {
                 Label("Couldn’t route audio. Allow SoundRouter in System Settings › Privacy & Security › Screen & System Audio Recording.",
@@ -130,9 +213,10 @@ struct AppRowView: View {
     }
 
     private func detail(_ rule: AppRule) -> String? {
-        if rule.muted { return "Muted" }
-        if rule.volume < 0.995 { return "Volume \(Int((rule.volume * 100).rounded()))%" }
-        return nil
+        var parts: [String] = []
+        if rule.muted { parts.append("Muted") } else if abs(rule.volume - 1) > 0.005 { parts.append("\(Int((rule.volume * 100).rounded()))%") }
+        if abs(rule.pan) > 0.01 { parts.append("Balance \(rule.pan < 0 ? "L" : "R")\(Int((abs(rule.pan) * 100).rounded()))") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -206,12 +290,12 @@ struct TabRowView: View {
                 } else if tab.audible {
                     PlayingIndicator()
                 }
-                Chip(title: model.chipTitle(route?.deviceUID, follow: "Same as \(shortName)"),
+                Chip(title: model.chipTitle(route?.deviceUID, extras: route?.extras ?? [], follow: "Same as \(shortName)"),
                      color: model.color(for: route?.deviceUID),
                      help: "Speaker for this tab", maxTextWidth: roomy ? 170 : 92) {
-                    model.speakerMenu(selected: route?.deviceUID, followTitle: "Same as \(browser)") {
-                        model.setDevice($0, forTab: tab)
-                    }
+                    model.speakerMenu(selected: route?.deviceUID, extras: route?.extras ?? [], followTitle: "Same as \(browser)",
+                                      onSelect: { model.setDevice($0, forTab: tab) },
+                                      onToggleExtra: route == nil ? nil : { model.toggleExtraDevice($0, forTab: tab) })
                 }
                 if route != nil {
                     ExpandButton(expanded: ui.expanded.contains(key)) { ui.toggle(key) }
@@ -220,9 +304,18 @@ struct TabRowView: View {
                 }
             }
             if let route, ui.expanded.contains(key) {
-                VolumeControl(value: route.volume, muted: route.muted,
-                              setValue: { model.setVolume($0, forTab: tab) },
-                              toggleMute: { model.toggleMute(forTab: tab) })
+                VStack(spacing: 4) {
+                    VolumeControl(value: route.volume, muted: route.muted, boost: true,
+                                  setValue: { model.setVolume($0, forTab: tab) },
+                                  toggleMute: { model.toggleMute(forTab: tab) })
+                    BalanceControl(value: route.balance) { model.setBalance($0, forTab: tab) }
+                }
+                .padding(.leading, 21)
+            }
+            if route == nil, let (host, site) = model.siteRule(for: tab) {
+                Text("Remembered for \(host): \(model.deviceName(site.deviceUID)). Click the SoundRouter button in this tab to apply.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 21)
             }
             if let error = model.tabErrors[tab.id] {

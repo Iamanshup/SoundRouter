@@ -4,19 +4,60 @@ import CoreAudio
 import ServiceManagement
 import SwiftUI
 
-/// Per-app setting. `deviceUID == nil` means "follow the system output".
+/// Per-app setting. `deviceUID == nil` means "follow the Mac default speaker".
+/// New fields are optional so rules saved by older versions still decode.
 struct AppRule: Codable, Equatable {
     var deviceUID: String?
     var volume: Float = 1
     var muted = false
     var name: String?
+    /// Further speakers that play the same audio.
+    var extraDeviceUIDs: [String]?
+    /// -1 (left) … 0 … +1 (right).
+    var balance: Float?
+
+    var extras: [String] { extraDeviceUIDs ?? [] }
+    var pan: Float { balance ?? 0 }
+
+    /// Nothing to do: plays on the Mac default, untouched.
+    var isNeutral: Bool {
+        deviceUID == nil && abs(volume - 1) < 0.001 && !muted && extras.isEmpty && abs(pan) < 0.001
+    }
 }
 
 /// A browser tab whose audio the extension captures and streams to us.
 struct TabRoute: Equatable {
     var deviceUID: String
+    var extras: [String] = []
     var volume: Float = 1
+    var balance: Float = 0
     var muted = false
+}
+
+/// A remembered speaker for a website, applied when the extension is opened on its tabs.
+struct SiteRule: Codable, Equatable {
+    var deviceUID: String
+    var extraDeviceUIDs: [String] = []
+    var volume: Float = 1
+}
+
+/// A saved setup: every app's speaker and volume, the Mac default and the alerts speaker.
+struct Preset: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var name: String
+    var rules: [String: AppRule]
+    var defaultUID: String?
+    var alerts: String   // see AudioModel.alertsSetting
+}
+
+/// "When <device> connects / disconnects, do <action>".
+struct Automation: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var deviceUID: String
+    var deviceName: String
+    var onConnect = true
+    var makeDefault = false
+    var presetID: UUID?
 }
 
 @MainActor
@@ -42,6 +83,26 @@ final class AudioModel: ObservableObject {
         }
     }
 
+    /// "" = leave alerts to macOS, "default" = follow the Mac default, otherwise a speaker uid.
+    @Published private(set) var alertsSetting = UserDefaults.standard.string(forKey: "alertsSetting") ?? ""
+    /// Per-speaker delay in ms, applied when audio plays on several speakers at once.
+    @Published private(set) var speakerDelays: [String: Float] = UserDefaults.standard.dictionary(forKey: "speakerDelays") as? [String: Float] ?? [:]
+    @Published private(set) var presets: [Preset] = AudioModel.load("presets") ?? []
+    @Published private(set) var automations: [Automation] = AudioModel.load("automations") ?? []
+    @Published private(set) var siteRules: [String: SiteRule] = AudioModel.load("siteRules") ?? [:]
+    @Published var rememberSites = UserDefaults.standard.object(forKey: "rememberSites") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(rememberSites, forKey: "rememberSites") }
+    }
+    @Published var shortcutsEnabled = UserDefaults.standard.object(forKey: "shortcutsEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(shortcutsEnabled, forKey: "shortcutsEnabled")
+            onShortcutsChanged?()
+        }
+    }
+    /// Names of every speaker seen, so automations can target ones that aren't connected now.
+    @Published private(set) var knownDevices: [String: String] = UserDefaults.standard.dictionary(forKey: "knownDevices") as? [String: String] ?? [:]
+    var onShortcutsChanged: (() -> Void)?
+
     @Published private(set) var tabs: [BrowserTab] = []
     @Published private(set) var tabRoutes: [String: TabRoute] = [:]
     @Published private(set) var tabErrors: [String: String] = [:]
@@ -49,11 +110,18 @@ final class AudioModel: ObservableObject {
     @Published var showAllTabs = false
 
     private let bridge = BrowserBridge()
+    /// Keyed "<tab key>|<speaker uid>".
     private var tabPlayers: [String: TabPlayer] = [:]
+    private var tabStreamRates: [String: Double] = [:]
+    private var routedTabKeys: Set<String> = []
     private var capturedTabs: Set<String> = []
+    /// Stopping Core Audio objects can block; never do it on the main thread.
+    private let teardown = DispatchQueue(label: "SoundRouter.teardown")
+    private var devicesInitialized = false
     private var softwareVolumes: [String: Float] = [:]
     /// Speaker uid -> palette index, persisted so a speaker keeps its colour.
     private var speakerColors: [String: Int] = UserDefaults.standard.dictionary(forKey: "speakerColors") as? [String: Int] ?? [:]
+    /// Keyed "<app id>|<speaker uid>".
     private var routers: [String: TapRouter] = [:]
     private var refreshScheduled = false
     private var timer: Timer?
@@ -66,7 +134,7 @@ final class AudioModel: ObservableObject {
         softwareVolumes = UserDefaults.standard.dictionary(forKey: "softwareVolumes") as? [String: Float] ?? [:]
 
         for selector in [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultOutputDevice,
-                         kAudioHardwarePropertyProcessObjectList] {
+                         kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioHardwarePropertyProcessObjectList] {
             CA.listen(systemObject, address(selector)) { [weak self] in
                 MainActor.assumeIsolated { self?.scheduleRefresh() }
             }
@@ -85,6 +153,16 @@ final class AudioModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+    }
+
+    // MARK: Persistence helpers
+
+    private static func load<T: Decodable>(_ key: String) -> T? {
+        UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode(T.self, from: $0) }
+    }
+
+    private func store<T: Encodable>(_ value: T, _ key: String) {
+        if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: key) }
     }
 
     // MARK: Queries
@@ -131,9 +209,15 @@ final class AudioModel: ObservableObject {
 
     func rule(for appID: String) -> AppRule { rules[appID] ?? AppRule() }
 
-    func isRouted(_ appID: String) -> Bool { routers[appID] != nil }
+    func isRouted(_ appID: String) -> Bool { routers.keys.contains { $0.hasPrefix(appID + "|") } }
 
     var defaultDevice: OutputDevice? { devices.first(where: \.isDefault) }
+
+    func device(_ uid: String?) -> OutputDevice? { uid.flatMap { u in devices.first { $0.uid == u } } }
+
+    func deviceName(_ uid: String) -> String { device(uid)?.name ?? knownDevices[uid] ?? "Unknown speaker" }
+
+    func delay(for uid: String) -> Float { speakerDelays[uid] ?? 0 }
 
     // MARK: Per-app actions
 
@@ -147,6 +231,19 @@ final class AudioModel: ObservableObject {
 
     func toggleMute(for app: AudioApp) {
         updateRule(app.id, name: app.name) { $0.muted.toggle() }
+    }
+
+    func setBalance(_ balance: Float, for app: AudioApp) {
+        updateRule(app.id, name: app.name) { $0.balance = abs(balance) < 0.04 ? nil : balance }
+    }
+
+    /// Adds or removes an extra speaker for an app.
+    func toggleExtraDevice(_ uid: String, for app: AudioApp) {
+        updateRule(app.id, name: app.name) { rule in
+            var extras = rule.extras
+            if let i = extras.firstIndex(of: uid) { extras.remove(at: i) } else { extras.append(uid) }
+            rule.extraDeviceUIDs = extras.isEmpty ? nil : extras
+        }
     }
 
     func removeRule(_ appID: String) {
@@ -165,7 +262,7 @@ final class AudioModel: ObservableObject {
         var rule = rules[id] ?? AppRule()
         change(&rule)
         rule.name = name
-        rules[id] = rule == AppRule(name: name) ? nil : rule
+        rules[id] = rule.isNeutral ? nil : rule
         saveRules()
         reconcile()
     }
@@ -200,6 +297,183 @@ final class AudioModel: ObservableObject {
     func makeDefault(_ device: OutputDevice) {
         DeviceManager.setDefaultOutput(device.id)
         scheduleRefresh()
+    }
+
+    func setBalance(_ value: Float, for device: OutputDevice) {
+        DeviceManager.setBalance(device.id, value)
+        if let i = devices.firstIndex(where: { $0.id == device.id }) { devices[i].balance = value }
+    }
+
+    func setDelay(_ ms: Float, for device: OutputDevice) {
+        speakerDelays[device.uid] = ms < 1 ? nil : ms
+        UserDefaults.standard.set(speakerDelays, forKey: "speakerDelays")
+        applyGains()
+        applyTabGains()
+    }
+
+    // MARK: Alert sounds
+
+    /// The speaker alerts actually play on right now.
+    var alertsDevice: OutputDevice? { devices.first(where: \.isAlertOutput) }
+
+    /// nil = follow the Mac default; a uid = that speaker.
+    func setAlertsDevice(_ uid: String?) {
+        alertsSetting = uid ?? "default"
+        UserDefaults.standard.set(alertsSetting, forKey: "alertsSetting")
+        enforceAlerts()
+    }
+
+    private func enforceAlerts() {
+        guard !alertsSetting.isEmpty, let fallback = defaultDevice else { return }
+        let target = alertsSetting == "default" ? fallback : (device(alertsSetting) ?? fallback)
+        if DeviceManager.systemOutputID() != target.id {
+            DeviceManager.setSystemOutput(target.id)
+            devices = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
+        }
+    }
+
+    // MARK: Presets
+
+    func savePreset(named name: String) {
+        presets.append(Preset(name: name, rules: rules, defaultUID: defaultDevice?.uid, alerts: alertsSetting))
+        store(presets, "presets")
+        onShortcutsChanged?()
+    }
+
+    func updatePreset(_ id: UUID) {
+        guard let i = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets[i].rules = rules
+        presets[i].defaultUID = defaultDevice?.uid
+        presets[i].alerts = alertsSetting
+        store(presets, "presets")
+    }
+
+    func renamePreset(_ id: UUID, to name: String) {
+        guard let i = presets.firstIndex(where: { $0.id == id }), !name.isEmpty else { return }
+        presets[i].name = name
+        store(presets, "presets")
+    }
+
+    func deletePreset(_ id: UUID) {
+        presets.removeAll { $0.id == id }
+        for i in automations.indices where automations[i].presetID == id { automations[i].presetID = nil }
+        store(presets, "presets")
+        store(automations, "automations")
+    }
+
+    func movePreset(_ id: UUID, by offset: Int) {
+        guard let i = presets.firstIndex(where: { $0.id == id }) else { return }
+        let j = max(0, min(presets.count - 1, i + offset))
+        presets.swapAt(i, j)
+        store(presets, "presets")
+    }
+
+    func applyPreset(_ id: UUID, announce: Bool = true) {
+        guard let preset = presets.first(where: { $0.id == id }) else { return }
+        rules = preset.rules
+        saveRules()
+        if let uid = preset.defaultUID, let target = device(uid), !target.isDefault {
+            DeviceManager.setDefaultOutput(target.id)
+            devices = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
+        }
+        alertsSetting = preset.alerts
+        UserDefaults.standard.set(alertsSetting, forKey: "alertsSetting")
+        enforceAlerts()
+        reconcile()
+        if announce { HUD.show("Preset: \(preset.name)", symbol: "square.stack.3d.up.fill") }
+    }
+
+    func applyPreset(at index: Int) {
+        guard presets.indices.contains(index) else {
+            HUD.show("No preset \(index + 1)", symbol: "square.stack.3d.up.slash")
+            return
+        }
+        applyPreset(presets[index].id)
+    }
+
+    /// The preset matching the current setup, if any.
+    var activePresetID: UUID? {
+        presets.first { $0.rules == rules && ($0.defaultUID == nil || $0.defaultUID == defaultDevice?.uid) }?.id
+    }
+
+    // MARK: Automations
+
+    func addAutomation(_ automation: Automation) {
+        automations.append(automation)
+        store(automations, "automations")
+    }
+
+    func updateAutomation(_ automation: Automation) {
+        guard let i = automations.firstIndex(where: { $0.id == automation.id }) else { return }
+        automations[i] = automation
+        store(automations, "automations")
+    }
+
+    func deleteAutomation(_ id: UUID) {
+        automations.removeAll { $0.id == id }
+        store(automations, "automations")
+    }
+
+    private func runAutomations(connected: Set<String>, disconnected: Set<String>) {
+        for automation in automations {
+            let fired = automation.onConnect ? connected.contains(automation.deviceUID) : disconnected.contains(automation.deviceUID)
+            guard fired else { continue }
+            var did: [String] = []
+            // Preset first, so the automation's own "make default" wins over the preset's saved default.
+            if let presetID = automation.presetID, let preset = presets.first(where: { $0.id == presetID }) {
+                applyPreset(presetID, announce: false)
+                did.append("applied \(preset.name)")
+            }
+            if automation.makeDefault, automation.onConnect, let target = device(automation.deviceUID) {
+                DeviceManager.setDefaultOutput(target.id)
+                devices = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
+                enforceAlerts()
+                reconcile()
+                did.insert("made it the Mac default", at: 0)
+            }
+            if !did.isEmpty {
+                HUD.show("\(automation.deviceName) \(automation.onConnect ? "connected" : "disconnected"): \(did.joined(separator: ", "))",
+                         symbol: automation.onConnect ? "link" : "link.badge.plus")
+            }
+        }
+    }
+
+    // MARK: Shortcut actions
+
+    func cycleDefaultSpeaker() {
+        guard !devices.isEmpty else { return }
+        let i = devices.firstIndex(where: \.isDefault) ?? -1
+        let next = devices[(i + 1) % devices.count]
+        DeviceManager.setDefaultOutput(next.id)
+        devices = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
+        enforceAlerts()
+        reconcile()
+        reconcileTabs()
+        HUD.show("Mac default: \(next.name)", symbol: next.symbol)
+    }
+
+    /// The app in front, as a rule key and display name.
+    private func frontmostApp() -> (id: String, name: String)? {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
+              let id = app.bundleIdentifier else { return nil }
+        return (id, app.localizedName ?? id)
+    }
+
+    func toggleMuteFrontmost() {
+        guard let (id, name) = frontmostApp() else { return }
+        updateRule(id, name: name) { $0.muted.toggle() }
+        let muted = rules[id]?.muted ?? false
+        HUD.show("\(name) \(muted ? "muted" : "unmuted")", symbol: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+    }
+
+    func nudgeFrontmostVolume(by delta: Float) {
+        guard let (id, name) = frontmostApp() else { return }
+        updateRule(id, name: name) { rule in
+            rule.volume = max(0, min(2, ((rule.volume + delta) * 10).rounded() / 10))
+            rule.muted = false
+        }
+        let volume = rules[id]?.volume ?? 1
+        HUD.show("\(name) \(Int((volume * 100).rounded()))%", symbol: volume > 1 ? "speaker.wave.3.fill" : "speaker.wave.2.fill")
     }
 
     // MARK: Microphones
@@ -260,13 +534,30 @@ final class AudioModel: ObservableObject {
     }
 
     func refresh() {
-        assignColors(DeviceManager.outputDevices(softwareVolumes: softwareVolumes))
         inputs = InputManager.inputDevices()
         enforceHeadsetGuard()
-        devices = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
+        updateDevices(DeviceManager.outputDevices(softwareVolumes: softwareVolumes))
+        enforceAlerts()
         apps = ProcessManager.audioApps()
         reconcile()
         reconcileTabs()
+    }
+
+    /// Records names and colours, and fires connect/disconnect automations.
+    private func updateDevices(_ fresh: [OutputDevice]) {
+        assignColors(fresh)
+        var namesChanged = false
+        for d in fresh where knownDevices[d.uid] != d.name {
+            knownDevices[d.uid] = d.name
+            namesChanged = true
+        }
+        if namesChanged { UserDefaults.standard.set(knownDevices, forKey: "knownDevices") }
+        let old = Set(devices.map(\.uid)), new = Set(fresh.map(\.uid))
+        devices = fresh
+        if devicesInitialized && old != new {
+            runAutomations(connected: new.subtracting(old), disconnected: old.subtracting(new))
+        }
+        devicesInitialized = true
     }
 
     private func tick() {
@@ -274,10 +565,9 @@ final class AudioModel: ObservableObject {
         if freshInputs != inputs { inputs = freshInputs }
         let fresh = DeviceManager.outputDevices(softwareVolumes: softwareVolumes)
         if fresh != devices {
-            assignColors(fresh)
             let deviceSetChanged = fresh.map(\.uid) != devices.map(\.uid)
-            devices = fresh
-            if deviceSetChanged { reconcileTabs() } else { applyTabGains() }
+            updateDevices(fresh)
+            if deviceSetChanged { enforceAlerts(); reconcile(); reconcileTabs() } else { applyGains(); applyTabGains() }
         }
         let freshApps = ProcessManager.audioApps()
         if freshApps != apps {
@@ -285,69 +575,116 @@ final class AudioModel: ObservableObject {
             reconcile()
         }
         var newLevels: [String: Float] = [:]
-        for (id, router) in routers { newLevels[id] = router.state.peak }
-        for (key, player) in tabPlayers { newLevels["tab:" + key] = player.state.peak }
+        for (key, router) in routers {
+            let id = String(key[..<key.lastIndex(of: "|")!])
+            newLevels[id] = max(newLevels[id] ?? 0, router.state.peak)
+        }
+        for (key, player) in tabPlayers {
+            let id = "tab:" + key[..<key.lastIndex(of: "|")!]
+            newLevels[id] = max(newLevels[id] ?? 0, player.state.peak)
+        }
         if newLevels != levels { levels = newLevels }
     }
 
-    /// Which device an app's audio should be sent to by us, or nil to leave it alone.
-    private func target(for rule: AppRule) -> OutputDevice? {
-        let chosen = rule.deviceUID.flatMap { uid in devices.first { $0.uid == uid } }
-        if let chosen, !chosen.isDefault { return chosen }
-        // Following the system output: only intercept when we must apply a volume/mute.
-        let needsGain = rule.volume < 0.999 || rule.muted
-        return needsGain ? (chosen ?? defaultDevice) : nil
+    /// The speakers SoundRouter should play an app on; empty to leave the app alone.
+    private func targets(for rule: AppRule) -> [OutputDevice] {
+        let base = device(rule.deviceUID) ?? defaultDevice
+        let extras = rule.extras.compactMap(device).filter { $0.uid != base?.uid }
+        guard let base else { return [] }
+        if !extras.isEmpty { return physical([base] + extras) }
+        if !base.isDefault { return physical([base]) }
+        // On the Mac default: only intercept to apply volume, mute or balance.
+        let needsProcessing = abs(rule.volume - 1) > 0.001 || rule.muted || abs(rule.pan) > 0.001
+        return needsProcessing ? physical([base]) : []
     }
 
-    private func gain(for rule: AppRule, on device: OutputDevice) -> Float {
-        if rule.muted { return 0 }
-        var g = rule.volume
+    /// Multi-output / aggregate devices can't be nested inside our routing device, so play on
+    /// the real speakers they contain instead (each once).
+    private func physical(_ list: [OutputDevice]) -> [OutputDevice] {
+        var seen: Set<String> = []
+        var out: [OutputDevice] = []
+        for d in list {
+            let parts = d.subDeviceUIDs.compactMap(device)
+            for p in parts.isEmpty ? [d] : parts where seen.insert(p.uid).inserted { out.append(p) }
+        }
+        return out
+    }
+
+    private func gain(volume: Float, muted: Bool, on device: OutputDevice) -> Float {
+        if muted { return 0 }
+        var g = volume
         // Devices without a hardware volume control get a software one.
         if !device.hasHardwareVolume { g *= device.muted ? 0 : device.volume }
         return g
+    }
+
+    private func configure(_ state: IOState, volume: Float, muted: Bool, balance: Float, on device: OutputDevice, multi: Bool) {
+        state.gain = gain(volume: volume, muted: muted, on: device)
+        state.balance = balance
+        let rate = CA.get(device.id, address(kAudioDevicePropertyNominalSampleRate), Float64(0)) ?? 48000
+        state.delayFrames = multi ? Int(Double(delay(for: device.uid)) / 1000 * rate) : 0
+    }
+
+    private func retire(_ router: TapRouter?) {
+        guard let router else { return }
+        teardown.async { router.stop() }
+    }
+
+    private func retire(_ player: TabPlayer?) {
+        guard let player else { return }
+        teardown.async { player.stop() }
     }
 
     private func reconcile() {
         var wanted: Set<String> = []
         var errors: [String: String] = [:]
         for app in apps {
-            guard let rule = rules[app.id], let device = target(for: rule) else { continue }
-            wanted.insert(app.id)
+            guard let rule = rules[app.id] else { continue }
+            let targets = targets(for: rule)
             let objects = app.processObjects.sorted()
-            if let existing = routers[app.id], existing.deviceUID == device.uid, existing.processObjects == objects {
-                existing.state.gain = gain(for: rule, on: device)
-                continue
-            }
-            routers[app.id]?.stop()
-            routers[app.id] = nil
-            do {
-                routers[app.id] = try TapRouter(name: app.name, processObjects: objects,
-                                                deviceUID: device.uid, gain: gain(for: rule, on: device))
-            } catch {
-                errors[app.id] = "\(error)"
-                NSLog("SoundRouter: routing \(app.name) failed: \(error)")
+            for device in targets {
+                let key = app.id + "|" + device.uid
+                wanted.insert(key)
+                if let existing = routers[key], existing.processObjects == objects {
+                    configure(existing.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+                    continue
+                }
+                retire(routers.removeValue(forKey: key))
+                do {
+                    let router = try TapRouter(name: app.name, processObjects: objects, deviceUID: device.uid, gain: 0)
+                    configure(router.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+                    routers[key] = router
+                } catch {
+                    errors[app.id] = "\(error)"
+                    NSLog("SoundRouter: routing \(app.name) to \(device.name) failed: \(error)")
+                }
             }
         }
-        for id in routers.keys where !wanted.contains(id) {
-            routers[id]?.stop()
-            routers[id] = nil
+        for key in routers.keys where !wanted.contains(key) {
+            retire(routers.removeValue(forKey: key))
         }
         if errors != routeErrors { routeErrors = errors }
     }
 
     private func applyGains() {
         for app in apps {
-            guard let router = routers[app.id], let rule = rules[app.id],
-                  let device = devices.first(where: { $0.uid == router.deviceUID }) else { continue }
-            router.state.gain = gain(for: rule, on: device)
+            guard let rule = rules[app.id] else { continue }
+            let targets = targets(for: rule)
+            for device in targets {
+                guard let router = routers[app.id + "|" + device.uid] else { continue }
+                configure(router.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+            }
         }
     }
 
     func shutdown() {
-        routers.values.forEach { $0.stop() }
+        // Taps and aggregate devices die with the process anyway; don't hang quitting.
+        let done = DispatchGroup()
+        for router in routers.values { done.enter(); teardown.async { router.stop(); done.leave() } }
+        for player in tabPlayers.values { done.enter(); teardown.async { player.stop(); done.leave() } }
         routers = [:]
-        tabPlayers.values.forEach { $0.stop() }
         tabPlayers = [:]
+        _ = done.wait(timeout: .now() + 2)
     }
 
     // MARK: Browser tabs
@@ -385,22 +722,71 @@ final class AudioModel: ObservableObject {
         if let uid {
             var route = tabRoutes[tab.id] ?? TabRoute(deviceUID: uid)
             route.deviceUID = uid
+            route.extras.removeAll { $0 == uid }
             tabRoutes[tab.id] = route
         } else {
             tabRoutes[tab.id] = nil
         }
+        rememberSite(for: tab)
         reconcileTabs()
     }
 
     func setVolume(_ volume: Float, forTab tab: BrowserTab) {
         tabRoutes[tab.id]?.volume = volume
+        rememberSite(for: tab)
         applyTabGains()
         broadcastState()
+    }
+
+    func setBalance(_ balance: Float, forTab tab: BrowserTab) {
+        tabRoutes[tab.id]?.balance = abs(balance) < 0.04 ? 0 : balance
+        applyTabGains()
     }
 
     func toggleMute(forTab tab: BrowserTab) {
         tabRoutes[tab.id]?.muted.toggle()
         applyTabGains()
+        broadcastState()
+    }
+
+    func toggleExtraDevice(_ uid: String, forTab tab: BrowserTab) {
+        guard var route = tabRoutes[tab.id] else { return }
+        if let i = route.extras.firstIndex(of: uid) { route.extras.remove(at: i) } else if uid != route.deviceUID { route.extras.append(uid) }
+        tabRoutes[tab.id] = route
+        rememberSite(for: tab)
+        reconcileTabs()
+    }
+
+    static func host(of url: String) -> String? {
+        guard let host = URL(string: url)?.host, !host.isEmpty else { return nil }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    /// Remembered speaker for a tab's website, if any.
+    func siteRule(for tab: BrowserTab) -> (host: String, rule: SiteRule)? {
+        guard let host = Self.host(of: tab.url), let rule = siteRules[host] else { return nil }
+        return (host, rule)
+    }
+
+    private func rememberSite(for tab: BrowserTab) {
+        guard rememberSites, let host = Self.host(of: tab.url) else { return }
+        if let route = tabRoutes[tab.id] {
+            siteRules[host] = SiteRule(deviceUID: route.deviceUID, extraDeviceUIDs: route.extras, volume: route.volume)
+        } else {
+            siteRules[host] = nil
+        }
+        store(siteRules, "siteRules")
+    }
+
+    func forgetSite(_ host: String) {
+        siteRules[host] = nil
+        store(siteRules, "siteRules")
+        broadcastState()
+    }
+
+    func setSiteDevice(_ uid: String, for host: String) {
+        siteRules[host]?.deviceUID = uid
+        store(siteRules, "siteRules")
         broadcastState()
     }
 
@@ -426,9 +812,16 @@ final class AudioModel: ObservableObject {
             guard let key, let tab = tabs.first(where: { $0.id == key }) else { return }
             if let volume = (msg["volume"] as? NSNumber)?.floatValue {
                 setVolume(volume, forTab: tab)
+            } else if msg["fromSite"] as? Bool == true, let (_, site) = siteRule(for: tab) {
+                // Re-applying a remembered website speaker, with its extras and volume.
+                tabErrors[key] = nil
+                tabRoutes[key] = TabRoute(deviceUID: site.deviceUID, extras: site.extraDeviceUIDs, volume: site.volume)
+                reconcileTabs()
             } else {
                 setDevice(msg["deviceUID"] as? String, forTab: tab)
             }
+        case "forgetSite":
+            if let host = msg["host"] as? String { forgetSite(host) }
         case "captured":
             if let key { capturedTabs.insert(key); tabErrors[key] = nil }
         case "captureFailed":
@@ -443,12 +836,18 @@ final class AudioModel: ObservableObject {
         case "debugStats":   // used by the bridge test script
             guard let key, let tab = tabs.first(where: { $0.id == key }) else { return }
             let stats = tabPlayerStats(key)
+            let players = tabPlayers.filter { $0.key.hasPrefix(key + "|") }.map(\.value)
+            let primary = tabRoutes[key].flatMap { tabPlayers[key + "|" + $0.deviceUID] } ?? players.first
             bridge.send(tab.connection, ["type": "debugStats", "tabId": tab.tabID,
                                          "callbacks": stats?.callbacks ?? 0, "peak": stats?.peak ?? 0,
-                                         "device": tabPlayers[key]?.deviceUID ?? "",
-                                         "sampleRate": tabPlayers[key]?.sampleRate ?? 0,
-                                         "skips": tabPlayers[key]?.skips ?? 0,
-                                         "underruns": tabPlayers[key]?.underruns ?? 0])
+                                         "device": primary?.deviceUID ?? "",
+                                         "sampleRate": primary?.sampleRate ?? 0,
+                                         "skips": primary?.skips ?? 0,
+                                         "underruns": primary?.underruns ?? 0,
+                                         "players": players.map { ["device": $0.deviceUID, "peak": $0.state.peak,
+                                                                   "peakLeft": $0.state.peakLeft, "peakRight": $0.state.peakRight,
+                                                                   "callbacks": $0.state.callbacks, "sampleRate": $0.sampleRate,
+                                                                   "streamRate": $0.streamRate, "underruns": $0.underruns] }])
         case "captureEnded":
             guard let key else { return }
             capturedTabs.remove(key)
@@ -469,59 +868,74 @@ final class AudioModel: ObservableObject {
         reconcileTabs()
     }
 
-    private func tabGain(_ route: TabRoute, on device: OutputDevice) -> Float {
-        if route.muted { return 0 }
-        var g = route.volume
-        if !device.hasHardwareVolume { g *= device.muted ? 0 : device.volume }
-        return g
+    private func tabTargets(_ route: TabRoute) -> [OutputDevice] {
+        guard let base = device(route.deviceUID) ?? defaultDevice else { return [] }
+        return physical([base] + route.extras.compactMap(device).filter { $0.uid != base.uid })
     }
 
     private func reconcileTabs() {
         let liveTabs = Set(tabs.map(\.id))
         for key in tabRoutes.keys where !liveTabs.contains(key) { tabRoutes[key] = nil }
 
+        var wantedPlayers: Set<String> = []
         for (key, route) in tabRoutes {
-            guard let tab = tabs.first(where: { $0.id == key }),
-                  let device = devices.first(where: { $0.uid == route.deviceUID }) ?? defaultDevice else { continue }
-            let deviceRate = CA.get(device.id, address(kAudioDevicePropertyNominalSampleRate), Float64(0))
-            if let player = tabPlayers[key], player.deviceUID == device.uid, deviceRate == nil || deviceRate == player.sampleRate {
-                player.state.gain = tabGain(route, on: device)
-                continue
-            }
-            let previousRate = tabPlayers[key]?.sampleRate
-            tabPlayers[key]?.stop()
-            do {
-                let player = try TabPlayer(device: device, gain: tabGain(route, on: device))
-                // Rebuild at the new rate; the extension re-renders the same tab stream to match.
-                player.onSampleRateChange = { [weak self] in MainActor.assumeIsolated { self?.reconcileTabs() } }
-                tabPlayers[key] = player
-                bridge.setPlayer(player, for: key)
-                if !capturedTabs.contains(key) || previousRate != player.sampleRate {
-                    bridge.send(tab.connection, ["type": "route", "tabId": tab.tabID, "sampleRate": player.sampleRate])
+            guard let tab = tabs.first(where: { $0.id == key }) else { continue }
+            let targets = tabTargets(route)
+            var players: [TabPlayer] = []
+            for device in targets {
+                let pkey = key + "|" + device.uid
+                wantedPlayers.insert(pkey)
+                let rate = CA.get(device.id, address(kAudioDevicePropertyNominalSampleRate), Float64(0))
+                if let existing = tabPlayers[pkey], rate == nil || rate == existing.sampleRate {
+                    configure(existing.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+                    players.append(existing)
+                    continue
                 }
-            } catch {
-                tabPlayers[key] = nil
-                bridge.setPlayer(nil, for: key)
-                tabErrors[key] = "\(error)"
+                retire(tabPlayers.removeValue(forKey: pkey))
+                do {
+                    let player = try TabPlayer(device: device, gain: 0)
+                    configure(player.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+                    // Rebuild at the new rate; the extension re-renders the same tab stream to match.
+                    player.onSampleRateChange = { [weak self] in MainActor.assumeIsolated { self?.reconcileTabs() } }
+                    tabPlayers[pkey] = player
+                    players.append(player)
+                } catch {
+                    tabErrors[key] = "\(error)"
+                }
+            }
+            guard let primary = players.first else { continue }
+            // One stream from the browser, at the first speaker's rate; others resample.
+            players.forEach { $0.streamRate = primary.sampleRate }
+            bridge.setPlayers(players, for: key)
+            if !capturedTabs.contains(key) || tabStreamRates[key] != primary.sampleRate {
+                tabStreamRates[key] = primary.sampleRate
+                bridge.send(tab.connection, ["type": "route", "tabId": tab.tabID, "sampleRate": primary.sampleRate])
             }
         }
-        for (key, player) in tabPlayers where tabRoutes[key] == nil {
-            player.stop()
-            tabPlayers[key] = nil
-            bridge.setPlayer(nil, for: key)
+        for pkey in tabPlayers.keys where !wantedPlayers.contains(pkey) {
+            retire(tabPlayers.removeValue(forKey: pkey))
+        }
+        // Tabs no longer routed: release the capture so they play normally again.
+        for key in routedTabKeys where tabRoutes[key] == nil {
+            bridge.setPlayers([], for: key)
+            tabStreamRates[key] = nil
+            capturedTabs.remove(key)
             let parts = key.split(separator: "/").compactMap { Int($0) }
             if parts.count == 2, browserConnections[parts[0]] != nil {
                 bridge.send(parts[0], ["type": "unroute", "tabId": parts[1]])
             }
-            capturedTabs.remove(key)
         }
+        routedTabKeys = Set(tabRoutes.keys)
         broadcastState()
     }
 
     private func applyTabGains() {
-        for (key, player) in tabPlayers {
-            guard let route = tabRoutes[key], let device = devices.first(where: { $0.uid == player.deviceUID }) else { continue }
-            player.state.gain = tabGain(route, on: device)
+        for (key, route) in tabRoutes {
+            let targets = tabTargets(route)
+            for device in targets {
+                guard let player = tabPlayers[key + "|" + device.uid] else { continue }
+                configure(player.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+            }
         }
     }
 
@@ -530,7 +944,8 @@ final class AudioModel: ObservableObject {
         let prefix = "\(conn)/"
         var routes: [String: Any] = [:]
         for (key, route) in tabRoutes where key.hasPrefix(prefix) {
-            routes[String(key.dropFirst(prefix.count))] = ["deviceUID": route.deviceUID, "volume": route.volume, "muted": route.muted]
+            routes[String(key.dropFirst(prefix.count))] = ["deviceUID": route.deviceUID, "volume": route.volume, "muted": route.muted,
+                                                           "extras": route.extras]
         }
         var errors: [String: String] = [:]
         for (key, error) in tabErrors where key.hasPrefix(prefix) { errors[String(key.dropFirst(prefix.count))] = error }
@@ -539,6 +954,8 @@ final class AudioModel: ObservableObject {
             "devices": devices.map { ["uid": $0.uid, "name": $0.name, "isDefault": $0.isDefault, "color": hex(nsColor(for: $0.uid))] },
             "routes": routes,
             "errors": errors,
+            "sites": siteRules.mapValues { ["deviceUID": $0.deviceUID, "volume": $0.volume] },
+            "rememberSites": rememberSites,
         ])
     }
 
@@ -553,11 +970,22 @@ final class AudioModel: ObservableObject {
 
     // MARK: Diagnostics (used by --selftest)
 
-    func routerStats(_ appID: String) -> (callbacks: UInt64, peak: Float)? {
-        routers[appID].map { ($0.state.callbacks, $0.state.peak) }
+    /// Per-speaker stats for an app's routers (used by tests).
+    func routerStats(_ appID: String) -> [String: IOState] {
+        var out: [String: IOState] = [:]
+        for (key, router) in routers where key.hasPrefix(appID + "|") { out[router.deviceUID] = router.state }
+        return out
     }
 
     func tabPlayerStats(_ key: String) -> (callbacks: UInt64, peak: Float)? {
-        tabPlayers[key].map { ($0.state.callbacks, $0.state.peak) }
+        let primary = tabRoutes[key].flatMap { tabPlayers[key + "|" + $0.deviceUID] }
+        return primary.map { ($0.state.callbacks, $0.state.peak) }
+    }
+
+    /// For tests: set a rule directly by app id.
+    func setRule(_ rule: AppRule?, forAppID id: String) {
+        rules[id] = rule
+        saveRules()
+        reconcile()
     }
 }

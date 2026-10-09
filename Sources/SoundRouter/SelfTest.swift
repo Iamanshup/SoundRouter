@@ -172,6 +172,23 @@ enum MenuTest {
         if ProcessInfo.processInfo.environment["SR_LONG"] != nil { AudioModel.shared.showBackgroundProcesses = true }
         if let expand = ProcessInfo.processInfo.environment["SR_EXPAND"] { UIState.shared.expanded.insert(expand) }
         if let section = ProcessInfo.processInfo.environment["SR_SECTION"] { UIState.shared.section = SidebarSection(rawValue: section) }
+        let demo = ProcessInfo.processInfo.environment["SR_DEMO"] != nil
+        let model = AudioModel.shared
+        let before = (model.presets.map(\.id), model.automations.map(\.id))
+        if demo {
+            model.savePreset(named: "Work")
+            model.savePreset(named: "Movie night")
+            if let uid = model.devices.first?.uid {
+                model.addAutomation(Automation(deviceUID: uid, deviceName: model.deviceName(uid), onConnect: true,
+                                               makeDefault: true, presetID: model.presets.last?.id))
+            }
+            if let uid = model.devices.first?.uid { UIState.shared.expanded.insert("spk:" + uid) }
+        }
+        func cleanUp() {
+            guard demo else { return }
+            for p in model.presets where !before.0.contains(p.id) { model.deletePreset(p.id) }
+            for a in model.automations where !before.1.contains(a.id) { model.deleteAutomation(a.id) }
+        }
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             statusBar.toggle()
@@ -194,6 +211,7 @@ enum MenuTest {
                 }
             }
             if ProcessInfo.processInfo.environment["SR_LONG"] != nil { AudioModel.shared.showBackgroundProcesses = false }
+            cleanUp()
             exit(0)
         }
     }
@@ -343,5 +361,281 @@ enum DockTest {
         say(failures == 0 ? "ALL PASSED" : "\(failures) FAILURE(S)")
         try? log.write(toFile: logPath, atomically: true, encoding: .utf8)
         exit(failures == 0 ? 0 : 1)
+    }
+}
+
+/// `SoundRouter --featuretest <log>`: alerts speaker, multiple speakers, boost, balance, delay,
+/// presets, automations and shortcuts. Creates a temporary virtual speaker (a multi-output device
+/// on the built-in speakers) so there is a second speaker to work with, and removes it afterwards.
+enum FeatureTest {
+    static let testUID = "com.soundrouter.test-speaker"
+
+    @MainActor static func run(_ logPath: String) async {
+        var log = ""
+        var failures = 0
+        func say(_ s: String) { log += s + "\n"; print(s) }
+        func expect(_ ok: Bool, _ what: String) { say((ok ? "PASS " : "FAIL ") + what); if !ok { failures += 1 } }
+        func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
+        let model = AudioModel.shared
+
+        // ---- DSP units
+        expect(DSP.softLimit(0.5) == 0.5 && DSP.softLimit(-0.7) == -0.7, "limiter leaves normal levels untouched")
+        let limited = DSP.softLimit(1.6)
+        expect(limited > 0.95 && limited < 1.0 && DSP.softLimit(-1.6) == -limited, "limiter keeps boosted peaks below full scale (1.6 → \(limited))")
+        let (l, r) = DSP.channelGains(gain: 1, balance: -1)
+        let (l2, r2) = DSP.channelGains(gain: 2, balance: 0.5)
+        expect(l == 1 && r == 0 && l2 == 1 && r2 == 2, "balance: full left mutes right; half right halves left")
+        let line = DelayLine(maxFrames: 100)
+        let buf = UnsafeMutablePointer<Float>.allocate(capacity: 64 * 2)
+        buf.initialize(repeating: 0, count: 128); buf[0] = 1; buf[1] = 1
+        line.process(buf, frames: 64, delay: 10)
+        expect(buf[20] == 1 && buf[0] == 0, "delay line shifts audio by the requested frames")
+        buf.deallocate()
+
+        // ---- Snapshot what we touch, to restore it.
+        let originalDefault = DeviceManager.defaultOutputID()
+        let originalSystem = DeviceManager.systemOutputID()
+        let originalAlerts = model.alertsSetting
+        let originalRules = model.rules
+        let originalPresets = model.presets.map(\.id)
+        let originalAutomations = model.automations.map(\.id)
+        guard let builtIn = model.devices.first(where: { $0.transport == kAudioDeviceTransportTypeBuiltIn }) else {
+            expect(false, "built-in speakers found"); finish(); return
+        }
+
+        // ---- Presets + automations, before the test speaker exists.
+        model.setRule(AppRule(deviceUID: builtIn.uid, volume: 0.5, name: "Preset probe"), forAppID: "test.preset.a")
+        model.savePreset(named: "Test Connect")
+        let presetA = model.presets.last!.id
+        model.setRule(nil, forAppID: "test.preset.a")
+        model.setRule(AppRule(volume: 0.25, name: "Preset probe"), forAppID: "test.preset.b")
+        model.savePreset(named: "Test Disconnect")
+        let presetB = model.presets.last!.id
+        expect(model.activePresetID == presetB, "the matching preset shows as active")
+        model.addAutomation(Automation(deviceUID: testUID, deviceName: "SoundRouter Test Speaker", onConnect: true, makeDefault: true, presetID: presetA))
+        model.addAutomation(Automation(deviceUID: testUID, deviceName: "SoundRouter Test Speaker", onConnect: false, makeDefault: false, presetID: presetB))
+
+        // ---- "Connect" a second speaker.
+        var testDevice = AudioObjectID(0)
+        let desc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "SoundRouter Test Speaker",
+            kAudioAggregateDeviceUIDKey: testUID,
+            kAudioAggregateDeviceIsStackedKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: builtIn.uid]],
+            kAudioAggregateDeviceMainSubDeviceKey: builtIn.uid,
+        ]
+        let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &testDevice)
+        expect(status == noErr, "created a temporary test speaker")
+        await wait(2.5)
+        let test = model.device(testUID)
+        expect(test != nil, "SoundRouter sees the new speaker")
+        expect(model.defaultDevice?.uid == testUID, "automation on connect: made it the Mac default")
+        expect(model.rules["test.preset.a"]?.volume == 0.5 && model.rules["test.preset.b"] == nil, "automation on connect: applied preset “Test Connect”")
+        expect(HUD.lastMessage?.contains("connected") == true, "automation shows a notice: \(HUD.lastMessage ?? "-")")
+
+        // ---- Alerts speaker.
+        model.setAlertsDevice(builtIn.uid)
+        await wait(0.5)
+        expect(DeviceManager.systemOutputID() == builtIn.id, "alerts go to \(builtIn.name) while the Mac default is the test speaker")
+        model.setAlertsDevice(nil)
+        await wait(0.5)
+        expect(DeviceManager.systemOutputID() == test?.id, "“Same as Mac default” sends alerts to the test speaker")
+
+        // ---- Hotkeys.
+        let registered = HotKeys.shared.registered.count
+        expect(registered == 14 || !model.shortcutsEnabled, "\(registered) global shortcuts registered")
+        let before = model.defaultDevice?.uid
+        HotKeys.shared.trigger(1)
+        await wait(0.5)
+        expect(model.defaultDevice?.uid != before && HUD.lastMessage?.hasPrefix("Mac default:") == true,
+               "⌃⌥⌘S switches the Mac default (\(HUD.lastMessage ?? "-"))")
+        HotKeys.shared.trigger(11)   // preset 2
+        await wait(0.3)
+        expect(model.rules["test.preset.b"]?.volume == 0.25, "⌃⌥⌘2 applies preset 2")
+
+        // ---- Real audio: multiple speakers, boost, balance, delay.
+        model.setRule(nil, forAppID: "test.preset.b")
+        let player = try? SpawnDisclaimed.run("/usr/bin/afplay", ["-v", "0.4", SelfTest.speechFile()])
+        var app: AudioApp?
+        for _ in 0..<40 {
+            await wait(0.15)
+            model.refresh()
+            app = model.apps.first { a in a.processObjects.contains { CA.get($0, address(kAudioProcessPropertyPID), pid_t(0)) == player } }
+            if app?.isPlaying == true { break }
+        }
+        expect(app != nil, "test player appears as an app (\(app?.name ?? "-"))")
+        if let app {
+            // The test speaker is a multi-output device: SoundRouter plays on the real speaker inside it.
+            model.setRule(AppRule(deviceUID: testUID, name: app.name), forAppID: app.id)
+            await wait(2)
+            var basePeak: Float = 0
+            for _ in 0..<15 { await wait(0.1); basePeak = max(basePeak, model.routerStats(app.id)[builtIn.uid]?.peak ?? 0) }
+            say("  to the test speaker at 100%: routers \(model.routerStats(app.id).keys.map { model.deviceName($0) }), peak \(basePeak)")
+            expect(model.routerStats(app.id).count == 1 && basePeak > 0.05,
+                   "routing to a multi-output device plays on the real speaker inside it")
+
+            // Two simultaneous captures of one app (what playing on several speakers uses).
+            if let a = try? TapRouter(name: "diag-a", processObjects: app.processObjects.sorted(), deviceUID: builtIn.uid, gain: 0.0001),
+               let b = try? TapRouter(name: "diag-b", processObjects: app.processObjects.sorted(), deviceUID: builtIn.uid, gain: 0.0001) {
+                var pa: Float = 0, pb: Float = 0
+                for _ in 0..<15 { await wait(0.1); pa = max(pa, a.state.peak); pb = max(pb, b.state.peak) }
+                expect(pa > 0 && pb > 0 && a.state.shortCallbacks == 0 && b.state.shortCallbacks == 0,
+                       "two simultaneous captures of one app both receive its audio (as for two speakers)")
+                a.stop(); b.stop()
+            }
+
+            // Test speaker + built-in: the same physical speaker, so it must play once, not twice.
+            model.setRule(AppRule(deviceUID: testUID, name: app.name, extraDeviceUIDs: [builtIn.uid]), forAppID: app.id)
+            await wait(1)
+            expect(model.routerStats(app.id).count == 1, "a speaker reachable two ways plays once (no doubled audio)")
+
+            // Boost + balance.
+            model.setRule(AppRule(deviceUID: testUID, volume: 1.5, name: app.name, balance: -1), forAppID: app.id)
+            await wait(1)
+            var left: Float = 0, right: Float = 0
+            for _ in 0..<20 {
+                await wait(0.1)
+                if let st = model.routerStats(app.id)[builtIn.uid] { left = max(left, st.peakLeft); right = max(right, st.peakRight) }
+            }
+            say("  150%, balance full left: L \(left), R \(right)")
+            expect(right == 0 && left > 0.05, "balance full left: right channel silent")
+            expect(left > basePeak * 1.3 && left < 1, "150% boost is louder than 100% and stays below full scale (\(left) vs \(basePeak))")
+            model.setRule(nil, forAppID: app.id)
+            await wait(0.5)
+            expect(model.routerStats(app.id).isEmpty, "removing the setting stops routing")
+        }
+        if let player { kill(player, SIGTERM) }
+        model.setDelay(0, for: builtIn)
+
+        // ---- Tab resampling: a 44.1 kHz browser stream on a 48 kHz speaker (as happens when a
+        // tab plays on two speakers with different rates).
+        func feed(_ player: TabPlayer, rate: Double, seconds: Double) async {
+            let chunk = Int(rate / 100)
+            var phase: Float = 0
+            let step = 2 * Float.pi * 440 / Float(rate)
+            var samples = [Float](repeating: 0, count: chunk * 2)
+            let start = Date()
+            var sent = 0
+            while Date().timeIntervalSince(start) < seconds {
+                let due = Int(Date().timeIntervalSince(start) * 100) + 1
+                while sent < due {
+                    for i in 0..<chunk { let v = 0.2 * sin(phase); phase += step; samples[2 * i] = v; samples[2 * i + 1] = v }
+                    samples.withUnsafeBufferPointer { player.ring.write($0, channels: 2) }
+                    sent += 1
+                }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        let deviceRate = CA.get(builtIn.id, address(kAudioDevicePropertyNominalSampleRate), Float64(48000)) ?? 48000
+        let streamRate: Double = deviceRate == 44100 ? 48000 : 44100
+        if let tab = try? TabPlayer(device: builtIn, gain: 0.001) {
+            tab.streamRate = streamRate
+            await feed(tab, rate: streamRate, seconds: 1)          // settle
+            let u0 = tab.underruns, s0 = tab.skips
+            await feed(tab, rate: streamRate, seconds: 3)
+            say("  tab stream \(Int(streamRate)) Hz on a \(Int(deviceRate)) Hz speaker: underruns +\(tab.underruns - u0), skips +\(tab.skips - s0), peak \(tab.state.peak / 0.001)")
+            expect(tab.underruns == u0 && tab.skips == s0 && tab.state.peak > 0.0001,
+                   "a tab stream at a different rate is resampled with no drift")
+            // Control: without resampling the same stream drifts.
+            tab.streamRate = deviceRate
+            await feed(tab, rate: streamRate, seconds: 1)
+            let u1 = tab.underruns, s1 = tab.skips
+            await feed(tab, rate: streamRate, seconds: 3)
+            expect(tab.underruns > u1 || tab.skips > s1, "control: without resampling it drifts (underruns +\(tab.underruns - u1), skips +\(tab.skips - s1))")
+            tab.stop()
+        }
+
+        // ---- ⌃⌥⌘M: mute the app in front.
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid(), let id = front.bundleIdentifier {
+            HotKeys.shared.trigger(2)
+            await wait(0.3)
+            let muted = model.rules[id]?.muted == true
+            HotKeys.shared.trigger(2)
+            await wait(0.3)
+            expect(muted && model.rules[id] == nil, "⌃⌥⌘M mutes and unmutes the app in front (\(front.localizedName ?? id))")
+            HotKeys.shared.trigger(3)
+            await wait(0.3)
+            expect(abs((model.rules[id]?.volume ?? 0) - 1.1) < 0.001, "⌃⌥⌘↑ raises the app in front to 110% (\(HUD.lastMessage ?? "-"))")
+            HotKeys.shared.trigger(4)
+            await wait(0.3)
+            expect(model.rules[id] == nil, "⌃⌥⌘↓ brings it back to 100%")
+        } else {
+            say("  (skipping app-in-front shortcuts: no other app in front)")
+        }
+
+        // ---- Hardware balance on the built-in speakers.
+        if let original = builtIn.balance {
+            model.setBalance(0.25, for: builtIn)
+            let readBack = CA.get(builtIn.id, DeviceManager.balanceAddress, Float32(0)) ?? -1
+            expect(abs(readBack - 0.25) < 0.05, "speaker balance set and read back (\(readBack))")
+            model.setBalance(original, for: builtIn)
+        } else {
+            say("  (built-in speakers have no hardware balance)")
+        }
+
+        // ---- "Disconnect" the test speaker.
+        if let originalDefault { DeviceManager.setDefaultOutput(originalDefault) }
+        AudioHardwareDestroyAggregateDevice(testDevice)
+        await wait(2.5)
+        expect(model.device(testUID) == nil, "test speaker removed")
+        expect(model.rules["test.preset.b"]?.volume == 0.25, "automation on disconnect: applied preset “Test Disconnect”")
+
+        // ---- Restore.
+        for p in model.presets where !originalPresets.contains(p.id) { model.deletePreset(p.id) }
+        for a in model.automations where !originalAutomations.contains(a.id) { model.deleteAutomation(a.id) }
+        for id in Set(model.rules.keys).union(originalRules.keys) { model.setRule(originalRules[id], forAppID: id) }
+        if let originalDefault { DeviceManager.setDefaultOutput(originalDefault) }
+        if originalAlerts.isEmpty {
+            if let originalSystem { DeviceManager.setSystemOutput(originalSystem) }
+            UserDefaults.standard.set("", forKey: "alertsSetting")
+        } else {
+            model.setAlertsDevice(originalAlerts == "default" ? nil : originalAlerts)
+        }
+        await wait(0.5)
+        say("restored: default=\(model.defaultDevice?.name ?? "?"), alerts=\(model.alertsDevice?.name ?? "?"), presets=\(model.presets.count), automations=\(model.automations.count), rules=\(model.rules.count)")
+        finish()
+
+        func finish() {
+            say(failures == 0 ? "ALL PASSED" : "\(failures) FAILURE(S)")
+            try? log.write(toFile: logPath, atomically: true, encoding: .utf8)
+            exit(failures == 0 ? 0 : 1)
+        }
+    }
+}
+
+extension SelfTest {
+    /// A spoken clip for audio tests.
+    static func speechFile() -> String {
+        let path = NSTemporaryDirectory() + "soundrouter-feature.aiff"
+        if !FileManager.default.fileExists(atPath: path) {
+            let say = Process()
+            say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+            say.arguments = ["-o", path, String(repeating: "Sound router feature test. ", count: 14)]
+            try? say.run(); say.waitUntilExit()
+        }
+        return path
+    }
+}
+
+/// Launches a process that is "responsible" for itself (not SoundRouter), so it shows up
+/// as its own app in the audio process list, like a normal app would.
+enum SpawnDisclaimed {
+    private typealias DisclaimFn = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
+    private static let disclaim: DisclaimFn? = {
+        guard let h = dlopen(nil, RTLD_NOW), let s = dlsym(h, "responsibility_spawnattrs_setdisclaim") else { return nil }
+        return unsafeBitCast(s, to: DisclaimFn.self)
+    }()
+
+    static func run(_ path: String, _ args: [String]) throws -> pid_t {
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        _ = disclaim?(&attr, 1)
+        var pid: pid_t = 0
+        let argv = ([path] + args).map { strdup($0) } + [nil]
+        defer { argv.forEach { free($0) } }
+        let rc = posix_spawn(&pid, path, nil, &attr, argv, environ)
+        guard rc == 0 else { throw CAError(what: "posix_spawn", status: rc) }
+        return pid
     }
 }

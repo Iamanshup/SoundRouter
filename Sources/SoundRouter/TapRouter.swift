@@ -1,16 +1,6 @@
 import CoreAudio
 import Foundation
 
-/// State shared with the real-time IO thread. Plain stores of Float/UInt64 are
-/// word-sized and tear-free on arm64/x86_64, which is all this needs.
-final class IOState: @unchecked Sendable {
-    var gain: Float = 1
-    var peak: Float = 0
-    var callbacks: UInt64 = 0
-    /// Callbacks where the tap delivered fewer frames than the device wanted (gaps).
-    var shortCallbacks: UInt64 = 0
-}
-
 /// Captures the audio of a set of processes with a Core Audio process tap (muting
 /// their normal output) and plays it on a chosen output device.
 final class TapRouter {
@@ -22,15 +12,23 @@ final class TapRouter {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private let queue = DispatchQueue(label: "SoundRouter.io", qos: .userInteractive)
+    private let scratchFrames = 8192
+    private let scratch: UnsafeMutablePointer<Float>
+    private let delayLine: DelayLine
 
     init(name: String, processObjects: [AudioObjectID], deviceUID: String, gain: Float) throws {
         self.processObjects = processObjects
         self.deviceUID = deviceUID
+        scratch = .allocate(capacity: scratchFrames * 2)
+        delayLine = DelayLine(maxFrames: 96_000)   // 0.5 s at up to 192 kHz
         state.gain = gain
         do { try start(name: name) } catch { stop(); throw error }
     }
 
-    deinit { stop() }
+    deinit {
+        stop()
+        scratch.deallocate()
+    }
 
     private func start(name: String) throws {
         let tap = CATapDescription(stereoMixdownOfProcesses: processObjects)
@@ -56,9 +54,8 @@ final class TapRouter {
         ]
         try check(AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateID), "Create aggregate device")
 
-        let state = self.state
-        try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) { _, input, _, output, _ in
-            TapRouter.render(input: input, output: output, state: state)
+        try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) { [unowned self] _, input, _, output, _ in
+            self.render(input: input, output: output)
         }, "Create IO proc")
         try check(AudioDeviceStart(aggregateID, procID), "Start device")
     }
@@ -79,14 +76,16 @@ final class TapRouter {
         }
     }
 
-    /// Real-time: copy the tapped stereo mix into the output device's buffers, applying gain.
-    /// Handles interleaved and non-interleaved layouts on both sides, and mono outputs.
-    private static func render(input: UnsafePointer<AudioBufferList>,
-                               output: UnsafeMutablePointer<AudioBufferList>,
-                               state: IOState) {
+    /// Real-time: gather the tapped stereo mix, delay it if asked, then write it out
+    /// with gain, balance and limiting. Handles interleaved and non-interleaved input.
+    private func render(input: UnsafePointer<AudioBufferList>, output: UnsafeMutablePointer<AudioBufferList>) {
         let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outs = UnsafeMutableAudioBufferListPointer(output)
-        let gain = state.gain
+        var frames = 0
+        for buf in outs where buf.mNumberChannels > 0 {
+            frames = max(frames, Int(buf.mDataByteSize) / (MemoryLayout<Float>.size * Int(buf.mNumberChannels)))
+        }
+        frames = min(frames, scratchFrames)
 
         // Locate up to two input channels: (base pointer, stride, frame count).
         var l: (UnsafePointer<Float>, Int, Int)?
@@ -94,52 +93,29 @@ final class TapRouter {
         for buf in ins {
             guard let data = buf.mData, buf.mNumberChannels > 0 else { continue }
             let ch = Int(buf.mNumberChannels)
-            let frames = Int(buf.mDataByteSize) / (MemoryLayout<Float>.size * ch)
+            let count = Int(buf.mDataByteSize) / (MemoryLayout<Float>.size * ch)
             let p = data.assumingMemoryBound(to: Float.self)
             for c in 0..<min(ch, 2) {
-                let entry = (UnsafePointer(p + c), ch, frames)
+                let entry = (UnsafePointer(p + c), ch, count)
                 if l == nil { l = entry } else if r == nil { r = entry }
             }
             if r != nil { break }
         }
         if r == nil { r = l }
 
-        var totalOutChannels = 0
-        for buf in outs { totalOutChannels += Int(buf.mNumberChannels) }
-
-        var peak: Float = 0
-        var outChannel = 0
-        var short = false
-        for buf in outs {
-            guard let data = buf.mData, buf.mNumberChannels > 0 else { continue }
-            let ch = Int(buf.mNumberChannels)
-            let frames = Int(buf.mDataByteSize) / (MemoryLayout<Float>.size * ch)
-            let p = data.assumingMemoryBound(to: Float.self)
-            for c in 0..<ch {
-                let g = outChannel + c
-                let src: (UnsafePointer<Float>, Int, Int)? = g == 0 ? l : (g == 1 ? r : nil)
-                let n = min(frames, src?.2 ?? 0)
-                if src != nil && n < frames { short = true }
-                if let (sp, ss, _) = src, totalOutChannels == 1, let (rp, rs, _) = r {
-                    // Mono device: downmix.
-                    for i in 0..<n {
-                        let v = (sp[i * ss] + rp[i * rs]) * 0.5 * gain
-                        p[i * ch + c] = v
-                        peak = max(peak, abs(v))
-                    }
-                } else if let (sp, ss, _) = src {
-                    for i in 0..<n {
-                        let v = sp[i * ss] * gain
-                        p[i * ch + c] = v
-                        peak = max(peak, abs(v))
-                    }
-                }
-                for i in n..<frames { p[i * ch + c] = 0 }
+        var got = 0
+        if let (lp, ls, ln) = l, let (rp, rs, rn) = r {
+            got = min(frames, ln, rn)
+            for i in 0..<got {
+                scratch[i * 2] = lp[i * ls]
+                scratch[i * 2 + 1] = rp[i * rs]
             }
-            outChannel += ch
         }
-        state.peak = peak
-        state.callbacks &+= 1
-        if short || l == nil { state.shortCallbacks &+= 1 }
+        for i in (got * 2)..<(frames * 2) { scratch[i] = 0 }
+        if got < frames { state.shortCallbacks &+= 1 }
+
+        delayLine.process(scratch, frames: frames, delay: state.delayFrames)
+        DSP.write(scratch, frames: frames, to: output, state: state)
+        _ = outs
     }
 }

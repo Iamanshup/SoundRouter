@@ -120,8 +120,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ connected: !!ws, ...appState, captured: [...captures.keys()] });
   } else if (msg.type === 'setRoute') {
     if (msg.streamId) pendingStreamIds.set(msg.tabId, msg.streamId);
-    send({ type: 'setRoute', tabId: msg.tabId, deviceUID: msg.deviceUID ?? null });
+    send({ type: 'setRoute', tabId: msg.tabId, deviceUID: msg.deviceUID ?? null, fromSite: !!msg.fromSite });
     sendResponse({ ok: !!ws });
+  } else if (msg.type === 'forgetSite') {
+    send({ type: 'forgetSite', host: msg.host });
   } else if (msg.type === 'setVolume') {
     send({ type: 'setRoute', tabId: msg.tabId, volume: msg.volume });
   }

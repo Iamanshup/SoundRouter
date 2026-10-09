@@ -1,3 +1,4 @@
+import AudioToolbox
 import CoreAudio
 import Foundation
 
@@ -12,6 +13,12 @@ struct OutputDevice: Identifiable, Hashable {
     var hasHardwareVolume: Bool
     var volume: Float          // 0...1 (hardware, or software fallback)
     var muted: Bool
+    /// Hardware left/right balance, 0 (left) … 0.5 (centre) … 1 (right); nil if unsupported.
+    var balance: Float?
+    /// Where alert and notification sounds play.
+    var isAlertOutput: Bool = false
+    /// For aggregate / multi-output devices: the real devices inside.
+    var subDeviceUIDs: [String] = []
 
     var symbol: String {
         switch transport {
@@ -33,11 +40,26 @@ enum DeviceManager {
 
     static func setDefaultOutput(_ id: AudioObjectID) {
         _ = CA.set(systemObject, address(kAudioHardwarePropertyDefaultOutputDevice), id)
+    }
+
+    /// The device macOS plays alerts and sound effects on ("Play sound effects through").
+    static func systemOutputID() -> AudioObjectID? {
+        CA.get(systemObject, address(kAudioHardwarePropertyDefaultSystemOutputDevice), AudioObjectID(0))
+    }
+
+    static func setSystemOutput(_ id: AudioObjectID) {
         _ = CA.set(systemObject, address(kAudioHardwarePropertyDefaultSystemOutputDevice), id)
+    }
+
+    static let balanceAddress = address(kAudioHardwareServiceDeviceProperty_VirtualMainBalance, kAudioObjectPropertyScopeOutput)
+
+    static func setBalance(_ id: AudioObjectID, _ value: Float) {
+        _ = CA.set(id, balanceAddress, Float32(max(0, min(1, value))))
     }
 
     static func outputDevices(softwareVolumes: [String: Float]) -> [OutputDevice] {
         let defaultID = defaultOutputID()
+        let alertID = systemOutputID()
         let ids = CA.array(systemObject, address(kAudioHardwarePropertyDevices), AudioObjectID(0))
         return ids.compactMap { id in
             let streams = CA.array(id, address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput), AudioStreamID(0))
@@ -52,9 +74,14 @@ enum DeviceManager {
             let hw = volumeElements(id)
             let volume = hw.isEmpty ? (softwareVolumes[uid] ?? 1) : hardwareVolume(id, hw)
             let muted = (CA.get(id, address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput), UInt32(0)) ?? 0) != 0
+            let balance = CA.settable(id, balanceAddress) ? CA.get(id, balanceAddress, Float32(0.5)) : nil
+            let subs = transport == kAudioDeviceTransportTypeAggregate
+                ? CA.array(id, address(kAudioAggregateDevicePropertyActiveSubDeviceList), AudioObjectID(0))
+                    .compactMap { CA.string($0, address(kAudioDevicePropertyDeviceUID)) }
+                : []
             return OutputDevice(id: id, uid: uid, name: name, transport: transport,
                                 isDefault: id == defaultID, hasHardwareVolume: !hw.isEmpty,
-                                volume: volume, muted: muted)
+                                volume: volume, muted: muted, balance: balance, isAlertOutput: id == alertID, subDeviceUIDs: subs)
         }
     }
 

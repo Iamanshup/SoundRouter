@@ -45,6 +45,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusBar = StatusBarController(openMain: { [weak self] in self?.showMainWindow() })
         showMainWindow()
+        let model = AudioModel.shared
+        let registerShortcuts = { [weak self] in
+            guard let self else { return }
+            if model.shortcutsEnabled {
+                HotKeys.shared.register(HotKeys.shared.shortcuts(for: model) { [weak self] in self?.statusBar?.toggle() })
+            } else {
+                HotKeys.shared.unregister()
+            }
+        }
+        model.onShortcutsChanged = { MainActor.assumeIsolated { registerShortcuts() } }
+        registerShortcuts()
+        if let i = CommandLine.arguments.firstIndex(of: "--featuretest"), CommandLine.arguments.indices.contains(i + 1) {
+            let path = CommandLine.arguments[i + 1]
+            Task { @MainActor in try? await Task.sleep(for: .seconds(1.5)); await FeatureTest.run(path) }
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--docktest"), CommandLine.arguments.indices.contains(i + 1) {
             let path = CommandLine.arguments[i + 1]
             Task { @MainActor in await DockTest.run(path, delegate: self) }

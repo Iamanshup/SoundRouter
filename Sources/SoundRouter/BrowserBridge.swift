@@ -28,7 +28,7 @@ final class BrowserBridge: @unchecked Sendable {
     private var nextID = 1
 
     private let lock = NSLock()
-    private var players: [String: TabPlayer] = [:]       // tab key -> player, guarded by lock
+    private var players: [String: [TabPlayer]] = [:]     // tab key -> players (one per speaker), guarded by lock
 
     func start() {
         let ws = NWProtocolWebSocket.Options()
@@ -57,8 +57,8 @@ final class BrowserBridge: @unchecked Sendable {
         }
     }
 
-    func setPlayer(_ player: TabPlayer?, for key: String) {
-        lock.lock(); players[key] = player; lock.unlock()
+    func setPlayers(_ list: [TabPlayer], for key: String) {
+        lock.lock(); players[key] = list.isEmpty ? nil : list; lock.unlock()
     }
 
     func send(_ connection: Int, _ message: [String: Any]) {
@@ -115,11 +115,13 @@ final class BrowserBridge: @unchecked Sendable {
         let tabID = data.withUnsafeBytes { Int(UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self))) }
         let channels = data.withUnsafeBytes { Int(UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self))) }
         guard channels == 1 || channels == 2 else { return }
-        lock.lock(); let player = players["\(id)/\(tabID)"]; lock.unlock()
-        guard let player else { return }
+        lock.lock(); let targets = players["\(id)/\(tabID)"] ?? []; lock.unlock()
+        guard !targets.isEmpty else { return }
         let count = (data.count - 8) / MemoryLayout<Float>.size
         var samples = [Float](repeating: 0, count: count)
         _ = samples.withUnsafeMutableBytes { data.copyBytes(to: $0, from: 8..<(8 + count * 4)) }
-        samples.withUnsafeBufferPointer { player.ring.write($0, channels: channels) }
+        samples.withUnsafeBufferPointer { buffer in
+            for player in targets { player.ring.write(buffer, channels: channels) }
+        }
     }
 }

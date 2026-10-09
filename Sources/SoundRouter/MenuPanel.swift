@@ -23,6 +23,7 @@ struct MenuBarView: View {
             // Explicit height: a ScrollView has no natural height and would collapse.
             ScrollView {
                 VStack(spacing: 10) {
+                    presetsCard
                     speakersCard
                     nowPlayingCard
                     micCard
@@ -50,12 +51,37 @@ struct MenuBarView: View {
         [
             ClosureMenuItem("Open SoundRouter…") { openMain() },
             .separator(),
+            ClosureMenuItem("Save Current Setup as Preset…") { promptSavePreset(model) },
+            .separator(),
             ClosureMenuItem("Launch at Login", checked: model.launchAtLogin) { model.launchAtLogin.toggle() },
+            ClosureMenuItem("Keyboard Shortcuts (\(HotKeys.modifierLabel)S, M, ↑, ↓, 1–9)", checked: model.shortcutsEnabled) { model.shortcutsEnabled.toggle() },
             ClosureMenuItem("Show Background Processes", checked: model.showBackgroundProcesses) { model.showBackgroundProcesses.toggle() },
             ClosureMenuItem("Reset All Apps to Mac Default") { model.resetAll() },
             .separator(),
             ClosureMenuItem("Quit SoundRouter") { NSApp.terminate(nil) },
         ]
+    }
+
+    private var presetsCard: some View {
+        Card(title: "Presets", accessory: AnyView(
+            Button { promptSavePreset(model) } label: {
+                Label("Save", systemImage: "plus").font(.system(size: 10, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+            .help("Save the current setup as a preset")
+        )) {
+            if model.presets.isEmpty {
+                Text("Save your current setup to switch back to it in one click.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                FlowLayout(spacing: 6) {
+                    ForEach(Array(model.presets.enumerated()), id: \.element.id) { index, preset in
+                        PresetPill(preset: preset, index: index)
+                    }
+                }
+            }
+        }
     }
 
     private var speakersCard: some View {
@@ -64,6 +90,8 @@ struct MenuBarView: View {
                 if index > 0 { Divider().padding(.leading, 36) }
                 SpeakerRow(device: device)
             }
+            Divider().padding(.leading, 36)
+            AlertsRow()
         }
     }
 

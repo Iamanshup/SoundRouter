@@ -89,6 +89,26 @@ try {
   const s3 = await stats(tabId);
   check(s3 && s3.peak > 0.02, `routing chosen in the app works on a tab the extension was opened on (peak ${s3 && s3.peak.toFixed(3)})`);
 
+  // Remembered website: a new tab on the same site is routed just by opening the popup.
+  const tab3 = await browser.newPage();
+  await tab3.goto('http://127.0.0.1:8099/?remember');
+  await tab3.click('#go');
+  await sleep(800);
+  const tab3Id = await offscreen.evaluate(() => (lastTabs.find((t) => t.url.endsWith('?remember')) || {}).id);
+  await tab3.bringToFront();
+  await ext.triggerAction(tab3);
+  const popup3 = await (await browser.waitForTarget((t) => t.url().endsWith('/popup.html'), { timeout: 5000 })).asPage();
+  await sleep(1500);
+  const site = await popup3.$eval('#site', (e) => getComputedStyle(e).display !== 'none' && e.textContent);
+  check(await offscreen.evaluate((id) => captures.has(id), tab3Id), 'opening the popup on a remembered site routes the tab with no click');
+  check(!!site && /Remembered for 127.0.0.1/.test(site), 'popup shows the remembered site: ' + (site || '').trim().replace(/\s+/g, ' '));
+  await popup3.$eval('#vol', (el) => el.max).then((max) => check(max === '200', 'popup volume goes to 200%'));
+  await popup3.click('#forget').catch(() => {});
+  await sleep(500);
+  await popup3.close().catch(() => {});
+  await tab3.close();
+  await sleep(500);
+
   // A tab the extension was never opened on: app-initiated routing must explain what to do.
   const tab2 = await browser.newPage();
   await tab2.goto('http://127.0.0.1:8099/?2');
@@ -102,6 +122,9 @@ try {
   await tab.close();
   await sleep(1000);
   check(!(await offscreen.evaluate((id) => captures.has(id), tabId)), 'closing a routed tab ends its capture');
+  // Leave no remembered test site behind.
+  await offscreen.evaluate(() => ws.send(JSON.stringify({ type: 'forgetSite', host: '127.0.0.1' })));
+  await sleep(300);
 } catch (e) {
   console.log('FAIL exception: ' + (e.stack || e));
   failures++;
