@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import AppKit
 import SwiftUI
 import CoreAudio
@@ -46,6 +47,8 @@ enum SelfTest {
         sayTask.executableURL = URL(fileURLWithPath: "/usr/bin/say")
         sayTask.arguments = ["-o", tmp, String(repeating: "Sound router test. ", count: 14)]
         try? sayTask.run(); sayTask.waitUntilExit()
+        let size = (try? FileManager.default.attributesOfItem(atPath: tmp)[.size] as? Int) ?? 0
+        say("  test clip: \(size) bytes, say exit \(sayTask.terminationStatus)")
         let player = Process()
         player.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
         player.arguments = ["-v", "0.4", tmp]
@@ -80,7 +83,7 @@ enum SelfTest {
                                        deviceUID: target.uid, gain: 1)
             var maxPeak: Float = 0
             for _ in 0..<30 { Thread.sleep(forTimeInterval: 0.1); maxPeak = max(maxPeak, router.state.peak) }
-            say("  gain 1.0: callbacks=\(router.state.callbacks) maxPeak=\(maxPeak)")
+            say("  gain 1.0: callbacks=\(router.state.callbacks) maxPeak=\(maxPeak)" + (player.isRunning ? "" : " — afplay already exited with status \(player.terminationStatus)"))
             expect(router.state.callbacks > 50, "IO proc running on \(target.name)")
             expect(maxPeak > 0.01, "tapped audio reaches the output buffers")
 
@@ -173,6 +176,14 @@ enum MenuTest {
         if let expand = ProcessInfo.processInfo.environment["SR_EXPAND"] { UIState.shared.expanded.insert(expand) }
         if let section = ProcessInfo.processInfo.environment["SR_SECTION"] { UIState.shared.section = SidebarSection(rawValue: section) }
         let demo = ProcessInfo.processInfo.environment["SR_DEMO"] != nil
+        let env = ProcessInfo.processInfo.environment
+        if env["SR_CALL"] != nil { AudioModel.shared.simulatedCallApps = ["com.example.call"] }
+        if let target = env["SR_EQ"] {   // "spk" or an app id
+            if target == "spk", let uid = AudioModel.shared.devices.first?.uid {
+                UIState.shared.expanded.insert("spk:" + uid)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.6) { UIState.shared.eqTarget = "spk:" + uid }
+            }
+        }
         let model = AudioModel.shared
         let before = (model.presets.map(\.id), model.automations.map(\.id))
         if demo {
@@ -210,6 +221,21 @@ enum MenuTest {
                     save(frame, background: appearance == .aqua ? .white : NSColor(white: 0.12, alpha: 1), to: "\(dir)/main-\(name).png")
                 }
             }
+            // Any other popovers (e.g. an EQ popover) and the welcome window.
+            NSApp.appearance = NSAppearance(named: .aqua)
+            try? await Task.sleep(for: .seconds(0.6))
+            var n = 0
+            for w in NSApp.windows where w.isVisible && w !== view.window && w !== main && "\(type(of: w))".contains("Popover") {
+                if let v = w.contentView { save(v, background: NSColor(white: 0.93, alpha: 1), to: "\(dir)/popover-\(n).png"); n += 1 }
+            }
+            if let page = env["SR_WELCOME"].flatMap(Int.init) {
+                Welcome.show(page: page)
+                try? await Task.sleep(for: .seconds(0.6))
+                if let w = NSApp.windows.first(where: { $0.title == "Welcome to SoundRouter" }), let v = w.contentView {
+                    save(v, background: .white, to: "\(dir)/welcome-\(page).png")
+                }
+            }
+            AudioModel.shared.simulatedCallApps = nil
             if ProcessInfo.processInfo.environment["SR_LONG"] != nil { AudioModel.shared.showBackgroundProcesses = false }
             cleanUp()
             exit(0)
@@ -364,7 +390,7 @@ enum DockTest {
     }
 }
 
-/// `SoundRouter --featuretest <log>`: alerts speaker, multiple speakers, boost, balance, delay,
+/// `SoundRouter --featuretest <log>`: alerts speaker, multiple speakers, boost, delay,
 /// presets, automations and shortcuts. Creates a temporary virtual speaker (a multi-output device
 /// on the built-in speakers) so there is a second speaker to work with, and removes it afterwards.
 enum FeatureTest {
@@ -382,9 +408,6 @@ enum FeatureTest {
         expect(DSP.softLimit(0.5) == 0.5 && DSP.softLimit(-0.7) == -0.7, "limiter leaves normal levels untouched")
         let limited = DSP.softLimit(1.6)
         expect(limited > 0.95 && limited < 1.0 && DSP.softLimit(-1.6) == -limited, "limiter keeps boosted peaks below full scale (1.6 → \(limited))")
-        let (l, r) = DSP.channelGains(gain: 1, balance: -1)
-        let (l2, r2) = DSP.channelGains(gain: 2, balance: 0.5)
-        expect(l == 1 && r == 0 && l2 == 1 && r2 == 2, "balance: full left mutes right; half right halves left")
         let line = DelayLine(maxFrames: 100)
         let buf = UnsafeMutablePointer<Float>.allocate(capacity: 64 * 2)
         buf.initialize(repeating: 0, count: 128); buf[0] = 1; buf[1] = 1
@@ -453,7 +476,7 @@ enum FeatureTest {
         await wait(0.3)
         expect(model.rules["test.preset.b"]?.volume == 0.25, "⌃⌥⌘2 applies preset 2")
 
-        // ---- Real audio: multiple speakers, boost, balance, delay.
+        // ---- Real audio: multiple speakers, boost, delay.
         model.setRule(nil, forAppID: "test.preset.b")
         let player = try? SpawnDisclaimed.run("/usr/bin/afplay", ["-v", "0.4", SelfTest.speechFile()])
         var app: AudioApp?
@@ -489,16 +512,16 @@ enum FeatureTest {
             await wait(1)
             expect(model.routerStats(app.id).count == 1, "a speaker reachable two ways plays once (no doubled audio)")
 
-            // Boost + balance.
-            model.setRule(AppRule(deviceUID: testUID, volume: 1.5, name: app.name, balance: -1), forAppID: app.id)
+            // Boost.
+            model.setRule(AppRule(deviceUID: testUID, volume: 1.5, name: app.name), forAppID: app.id)
             await wait(1)
             var left: Float = 0, right: Float = 0
             for _ in 0..<20 {
                 await wait(0.1)
                 if let st = model.routerStats(app.id)[builtIn.uid] { left = max(left, st.peakLeft); right = max(right, st.peakRight) }
             }
-            say("  150%, balance full left: L \(left), R \(right)")
-            expect(right == 0 && left > 0.05, "balance full left: right channel silent")
+            say("  150%: L \(left), R \(right)")
+            expect(left > 0.05 && right > 0.05, "both channels play")
             expect(left > basePeak * 1.3 && left < 1, "150% boost is louder than 100% and stays below full scale (\(left) vs \(basePeak))")
             model.setRule(nil, forAppID: app.id)
             await wait(0.5)
@@ -561,16 +584,6 @@ enum FeatureTest {
             expect(model.rules[id] == nil, "⌃⌥⌘↓ brings it back to 100%")
         } else {
             say("  (skipping app-in-front shortcuts: no other app in front)")
-        }
-
-        // ---- Hardware balance on the built-in speakers.
-        if let original = builtIn.balance {
-            model.setBalance(0.25, for: builtIn)
-            let readBack = CA.get(builtIn.id, DeviceManager.balanceAddress, Float32(0)) ?? -1
-            expect(abs(readBack - 0.25) < 0.05, "speaker balance set and read back (\(readBack))")
-            model.setBalance(original, for: builtIn)
-        } else {
-            say("  (built-in speakers have no hardware balance)")
         }
 
         // ---- "Disconnect" the test speaker.
@@ -698,5 +711,218 @@ enum FullScreenTest {
             try? log.write(toFile: logPath, atomically: true, encoding: .utf8)
             exit(failures == 0 ? 0 : 1)
         }
+    }
+}
+
+/// `SoundRouter --feature2test <log>`: call ducking, EQ, pin/ignore, shortcut targets and
+/// reassignment, soundrouter:// links. Restores all settings it touches.
+enum FeatureTest2 {
+    @MainActor static func run(_ logPath: String) async {
+        var log = ""
+        var failures = 0
+        func say(_ s: String) { log += s + "\n"; print(s) }
+        func expect(_ ok: Bool, _ what: String) { say((ok ? "PASS " : "FAIL ") + what); if !ok { failures += 1 } }
+        func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
+        let model = AudioModel.shared
+        let hot = HotKeys.shared
+
+        // ---- EQ: measure real filter response with sine waves.
+        func gainDB(_ bands: [EQBand], preamp: Double = 0, freq: Double, rate: Double = 48000) -> Double {
+            let eq = EQProcessor()
+            eq.set(bands, preampDB: preamp, sampleRate: rate)
+            let n = 48000
+            let buf = UnsafeMutablePointer<Float>.allocate(capacity: n * 2)
+            defer { buf.deallocate() }
+            for i in 0..<n { let v = Float(0.1 * sin(2 * Double.pi * freq * Double(i) / rate)); buf[2 * i] = v; buf[2 * i + 1] = v }
+            // RMS, not sample peaks: at high frequencies samples miss the true peak.
+            func rms() -> Double { var sum = 0.0; for i in (n / 2)..<n { sum += Double(buf[2 * i] * buf[2 * i]) }; return sqrt(sum / Double(n / 2)) }
+            let before = rms()
+            eq.process(buf, frames: n)
+            return 20 * log10(rms() / before)
+        }
+        let shelf = [EQBand(kind: .lowShelf, frequency: 200, gain: 12, q: 0.71)]
+        let low = gainDB(shelf, freq: 40), high = gainDB(shelf, freq: 8000)
+        expect(abs(low - 12) < 1 && abs(high) < 0.5, String(format: "low shelf +12 dB: %.1f dB at 40 Hz, %.1f dB at 8 kHz", low, high))
+        let peakBand = [EQBand(kind: .peak, frequency: 1000, gain: -9, q: 1.41)]
+        let atPeak = gainDB(peakBand, freq: 1000), away = gainDB(peakBand, freq: 100)
+        expect(abs(atPeak + 9) < 0.5 && abs(away) < 0.5, String(format: "peaking −9 dB at 1 kHz: %.1f dB there, %.1f dB at 100 Hz", atPeak, away))
+        let bass = GraphicEQ.presets.first { $0.name == "Bass Boost" }!.gains
+        let at62 = gainDB(GraphicEQ.bands(bass), freq: 62), at4k = gainDB(GraphicEQ.bands(bass), freq: 4000)
+        expect(at62 > 5 && at62 < 10 && abs(at4k) < 1.5, String(format: "“Bass Boost” preset: %+.1f dB at 62 Hz, %+.1f dB at 4 kHz", at62, at4k))
+        let profiles = AudioModel.bundledProfiles
+        let xm5 = profiles.first { $0.name.contains("WH-1000XM5") }
+        expect(profiles.count == 3 && xm5?.bands.count == 10 && xm5?.preamp == -6.2,
+               "bundled headphone profiles load (\(profiles.map(\.name).joined(separator: ", ")))")
+
+        // ---- Snapshot settings to restore.
+        let saved = (model.duckingEnabled, model.duckLevel, model.speakerEQ, model.speakerProfiles, model.pinnedApps,
+                     model.ignoredApps, model.shortcutTarget, model.rules, model.presets.map(\.id), model.defaultDevice?.id)
+        let savedHotkeys = hot.combos
+        guard let builtIn = model.devices.first(where: { $0.transport == kAudioDeviceTransportTypeBuiltIn }) else {
+            expect(false, "built-in speakers found"); return finish()
+        }
+
+        // ---- A playing app to work with.
+        let pid = try? SpawnDisclaimed.run("/usr/bin/afplay", ["-v", "0.4", SelfTest.speechFile()])
+        var player: AudioApp?
+        for _ in 0..<40 {
+            await wait(0.15); model.refresh()
+            player = model.apps.first { a in a.processObjects.contains { CA.get($0, address(kAudioProcessPropertyPID), pid_t(0)) == pid } }
+            if player?.isPlaying == true { break }
+        }
+        guard let app = player else { expect(false, "test player is playing"); return finish() }
+        expect(true, "test player is playing (\(app.name))")
+        expect(model.apps.allSatisfy { !$0.isRecording || $0.isRegularApp || !model.callApps.contains($0.id) },
+               "background processes using the mic (e.g. Siri) don’t count as calls")
+
+        func alive(_ label: String) {
+            let running = pid.map { kill($0, 0) == 0 } ?? false
+            let listed = model.apps.first { a in a.processObjects.contains { CA.get($0, address(kAudioProcessPropertyPID), pid_t(0)) == pid } }
+            say("  [\(label)] player alive=\(running) listed=\(listed != nil) playing=\(listed?.isPlaying ?? false) objects=\(listed?.processObjects.count ?? 0)")
+        }
+        alive("start")
+
+        // ---- Call ducking.
+        model.duckingEnabled = true
+        model.duckLevel = 0.2
+        await wait(0.5)
+        expect(model.routerStats(app.id).isEmpty, "before a call, an untouched app isn’t routed")
+        model.simulatedCallApps = ["com.example.call"]
+        await wait(1.5)
+        alive("in call")
+        var stats = model.routerStats(app.id)[builtIn.uid]
+        var duckedPeak: Float = 0
+        for _ in 0..<15 { await wait(0.1); duckedPeak = max(duckedPeak, model.routerStats(app.id)[builtIn.uid]?.peak ?? 0) }
+        say("  during call: gain \(stats?.gain ?? -1), peak \(duckedPeak)")
+        expect(model.isInCall && abs((stats?.gain ?? 0) - 0.2) < 0.001 && duckedPeak > 0.005 && duckedPeak < 0.15,
+               "during a call the playing app drops to 20%")
+        expect(HUD.lastMessage?.contains("Call detected") == true, "a notice says the call was detected")
+        let meet = BrowserTab(connection: 0, tabID: 1, browser: "Chrome", title: "Meet", url: "https://meet.google.com/abc", audible: true)
+        let yt = BrowserTab(connection: 0, tabID: 2, browser: "Chrome", title: "YouTube", url: "https://www.youtube.com/watch?v=1", audible: true)
+        expect(model.tabDuck(meet) == 1 && model.tabDuck(yt) == 0.2, "routed tabs are lowered too, except call sites like Meet")
+        model.simulatedCallApps = ["com.example.call", app.id]
+        await wait(1)
+        expect(model.routerStats(app.id).isEmpty, "the app in the call itself isn’t lowered")
+        model.simulatedCallApps = []
+        await wait(1.5)
+        expect(!model.isInCall && model.routerStats(app.id).isEmpty, "after the call, the app goes back to normal")
+        model.simulatedCallApps = nil
+
+        alive("before EQ")
+        // ---- EQ on live audio.
+        model.setEQ(bass, for: app)
+        await wait(1.5)
+        stats = model.routerStats(app.id)[builtIn.uid]
+        var eqPeak: Float = 0
+        for _ in 0..<10 { await wait(0.1); eqPeak = max(eqPeak, model.routerStats(app.id)[builtIn.uid]?.peak ?? 0) }
+        expect(stats?.eq.isActive == true && stats?.limit == true && eqPeak > 0.02, "app EQ is applied to its audio (peak \(eqPeak))")
+        model.setEQ(nil, for: app)
+        await wait(1)
+        expect(model.routerStats(app.id).isEmpty, "turning the app EQ off stops routing it")
+        model.setProfile(xm5, for: builtIn)
+        await wait(1.5)
+        stats = model.routerStats(app.id)[builtIn.uid]
+        expect(stats?.eq.isActive == true, "a speaker’s correction profile automatically reaches apps playing on it")
+        model.setProfile(nil, for: builtIn)
+        await wait(1)
+        expect(model.routerStats(app.id).isEmpty, "removing the speaker profile stops routing")
+
+        // ---- Pin and ignore.
+        model.pin(id: "com.apple.TextEdit", name: "TextEdit")
+        let pinned = model.nowPlaying.first { $0.id == "com.apple.TextEdit" }
+        expect(pinned != nil && model.nowPlaying.first?.id == "com.apple.TextEdit" || pinned?.pid == 0, "a pinned app is listed first, even when it isn’t running")
+        model.togglePin(pinned ?? app)
+        expect(!model.nowPlaying.contains { $0.id == "com.apple.TextEdit" }, "unpinning removes it")
+        model.setRule(AppRule(volume: 0.5, name: app.name), forAppID: app.id)
+        await wait(1)
+        expect(!model.routerStats(app.id).isEmpty, "an app with a setting is routed")
+        model.setIgnored(true, id: app.id, name: app.name)
+        await wait(1)
+        expect(model.routerStats(app.id).isEmpty && !model.visibleApps.contains { $0.id == app.id },
+               "an ignored app is left completely alone and hidden")
+        model.setIgnored(false, id: app.id, name: app.name)
+        await wait(1)
+        expect(!model.routerStats(app.id).isEmpty, "un-ignoring brings its setting back")
+        model.setRule(nil, forAppID: app.id)
+
+        alive("before shortcuts")
+        // ---- Shortcut target and reassignment.
+        model.shortcutTarget = "playing"
+        expect(model.shortcutTargetApp()?.id == app.id, "shortcuts act on the app playing sound (\(model.shortcutTargetApp()?.name ?? "-"))")
+        if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, front != app.id {
+            model.shortcutTarget = "front"
+            expect(model.shortcutTargetApp()?.id == front, "…or on the app in front, if chosen")
+            model.shortcutTarget = "playing"
+        }
+        hot.trigger(HotKeys.Action.mute.rawValue)
+        await wait(0.3)
+        expect(model.rules[app.id]?.muted == true, "the mute shortcut mutes the playing app")
+        hot.trigger(HotKeys.Action.mute.rawValue)
+        await wait(0.3)
+        let f6 = KeyCombo(keyCode: kVK_F6, modifiers: 0, key: "F6")
+        hot.setCombo(f6, for: .mute)
+        expect(hot.combo(for: .mute) == f6 && (hot.registered.isEmpty || hot.registered.contains { $0.combo == f6 }),
+               "the mute shortcut can be reassigned (to F6) and macOS accepts it")
+        hot.setCombo(HotKeys.Action.switchSpeaker.defaultCombo, for: .mute)
+        expect(hot.combo(for: .switchSpeaker) == nil, "assigning a shortcut already in use takes it from the other action")
+        hot.resetToDefaults()
+        expect(hot.combo(for: .mute)?.label == "⌃⌥⌘M" && hot.combo(for: .switchSpeaker)?.label == "⌃⌥⌘S", "restoring defaults works")
+        expect(!KeyCombo(keyCode: kVK_ANSI_A, modifiers: 0, key: "A").isUsable && KeyCombo(keyCode: kVK_ANSI_A, modifiers: UInt32(cmdKey | optionKey), key: "A").isUsable,
+               "plain letters are refused (they'd block typing); combos with ⌘/⌥/⌃ are accepted")
+
+        // ---- soundrouter:// links.
+        model.savePreset(named: "Link Test")
+        model.setRule(AppRule(volume: 0.3, name: "x"), forAppID: "test.link")
+        var reply = model.handle(URL(string: "soundrouter://preset/Link%20Test")!)
+        expect(model.rules["test.link"] == nil && reply.contains("Link Test"), "soundrouter://preset/<name> applies a preset (\(reply))")
+        reply = model.handle(URL(string: "soundrouter://app/\(app.name)?volume=50&mute=1")!)
+        expect(model.rules[app.id]?.volume == 0.5 && model.rules[app.id]?.muted == true, "soundrouter://app/… sets volume and mute (\(reply))")
+        reply = model.handle(URL(string: "soundrouter://app/\(app.name)?speaker=default&volume=100&mute=0")!)
+        expect(model.rules[app.id] == nil, "…and can put it back to normal (\(reply))")
+        let encodedSpeaker = builtIn.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)!
+        reply = model.handle(URL(string: "soundrouter://speaker/\(encodedSpeaker)")!)
+        await wait(0.5)
+        expect(model.defaultDevice?.uid == builtIn.uid, "soundrouter://speaker/<name> sets the Mac default (\(reply))")
+        model.handle(URL(string: "soundrouter://ducking/off")!)
+        expect(!model.duckingEnabled, "soundrouter://ducking/off works")
+        reply = model.handle(URL(string: "soundrouter://preset/Nope")!)
+        expect(reply.contains("No preset"), "a bad link explains what's wrong (\(reply))")
+        let handler = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "soundrouter://panel")!)
+        expect(handler?.lastPathComponent == "SoundRouter.app", "macOS opens soundrouter:// links with SoundRouter (\(handler?.path ?? "none"))")
+
+        if let pid { kill(pid, SIGTERM) }
+
+        // ---- Restore.
+        for p in model.presets where !saved.8.contains(p.id) { model.deletePreset(p.id) }
+        model.duckingEnabled = saved.0
+        model.duckLevel = saved.1
+        for d in model.devices {
+            model.setEQ(saved.2[d.uid], for: d)
+            model.setProfile(saved.3[d.uid], for: d)
+        }
+        for (id, _) in model.pinnedApps where saved.4[id] == nil { model.togglePin(AudioApp(id: id, name: "", pid: 0, processObjects: [], isPlaying: false, isRegularApp: true)) }
+        for (id, name) in model.ignoredApps where saved.5[id] == nil { model.setIgnored(false, id: id, name: name) }
+        model.shortcutTarget = saved.6
+        for id in Set(model.rules.keys).union(saved.7.keys) { model.setRule(saved.7[id], forAppID: id) }
+        if let original = saved.9 { DeviceManager.setDefaultOutput(original) }
+        if savedHotkeys.isEmpty { hot.resetToDefaults() }
+        await wait(0.5)
+        say("restored: ducking=\(model.duckingEnabled) \(model.duckLevel), speakerEQ=\(model.speakerEQ.count), profiles=\(model.speakerProfiles.count), pinned=\(model.pinnedApps.count), ignored=\(model.ignoredApps.count), rules=\(model.rules.count), presets=\(model.presets.count)")
+        finish()
+
+        func finish() {
+            say(failures == 0 ? "ALL PASSED" : "\(failures) FAILURE(S)")
+            try? log.write(toFile: logPath, atomically: true, encoding: .utf8)
+            exit(failures == 0 ? 0 : 1)
+        }
+    }
+}
+
+extension NSView {
+    /// Finds a button by title in this view's hierarchy (used by the screenshot mode).
+    func findButton(titled titles: [String]) -> NSButton? {
+        if let b = self as? NSButton, titles.contains(b.title) { return b }
+        for sub in subviews { if let b = sub.findButton(titled: titles) { return b } }
+        return nil
     }
 }

@@ -59,6 +59,7 @@ struct SpeakerRow: View {
                 HStack(spacing: 6) {
                     Text(device.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     if device.isDefault { Badge(text: "Mac default") }
+                    if model.hasEQ(device.uid) { Badge(text: "EQ", color: .secondary) }
                     Spacer(minLength: 4)
                     if !device.isDefault {
                         Button("Make default") { model.makeDefault(device) }
@@ -78,10 +79,10 @@ struct SpeakerRow: View {
                             .font(.system(size: 9)).foregroundStyle(.tertiary)
                     }
                     if expanded {
-                        if let balance = device.balance {
-                            BalanceControl(value: balance * 2 - 1) { model.setBalance(($0 + 1) / 2, for: device) }
-                        }
                         DelayControl(ms: model.delay(for: device.uid)) { model.setDelay($0, for: device) }
+                        EQButton(active: model.hasEQ(device.uid), key: "spk:" + device.uid) {
+                            SpeakerEQPopover(device: device).environmentObject(model)
+                        }
                     }
                 }
             }
@@ -167,9 +168,14 @@ struct AppRowView: View {
                 }
                 .frame(width: 22, height: 22)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(app.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    HStack(spacing: 4) {
+                        Text(app.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                        if model.pinnedApps[app.id] != nil {
+                            Image(systemName: "pin.fill").font(.system(size: 8)).foregroundStyle(.secondary).help("Pinned")
+                        }
+                    }
                     if let detail = detail(rule) {
-                        Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                        Text(detail).font(.system(size: 10)).foregroundStyle(model.isDucked(app) ? Color.orange : Color.secondary)
                     }
                 }
                 Spacer(minLength: 4)
@@ -190,11 +196,13 @@ struct AppRowView: View {
             }
             .contentShape(Rectangle())
             if expanded {
-                VStack(spacing: 4) {
+                VStack(alignment: .leading, spacing: 4) {
                     VolumeControl(value: rule.volume, muted: rule.muted, boost: true,
                                   setValue: { model.setVolume($0, for: app) },
                                   toggleMute: { model.toggleMute(for: app) })
-                    BalanceControl(value: rule.pan) { model.setBalance($0, for: app) }
+                    EQButton(active: rule.hasEQ, key: "app:" + app.id) {
+                        AppEQPopover(app: app).environmentObject(model)
+                    }
                 }
                 .padding(.leading, 31)
             }
@@ -210,12 +218,15 @@ struct AppRowView: View {
                     .padding(.leading, 31)
             }
         }
+        .contextMenu { AppRowMenu(app: app) }
     }
 
     private func detail(_ rule: AppRule) -> String? {
         var parts: [String] = []
+        if app.pid == 0 { parts.append("Not running") }
+        if model.isDucked(app) { parts.append("Lowered for call") }
         if rule.muted { parts.append("Muted") } else if abs(rule.volume - 1) > 0.005 { parts.append("\(Int((rule.volume * 100).rounded()))%") }
-        if abs(rule.pan) > 0.01 { parts.append("Balance \(rule.pan < 0 ? "L" : "R")\(Int((abs(rule.pan) * 100).rounded()))") }
+        if rule.hasEQ { parts.append("EQ") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
@@ -308,7 +319,6 @@ struct TabRowView: View {
                     VolumeControl(value: route.volume, muted: route.muted, boost: true,
                                   setValue: { model.setVolume($0, forTab: tab) },
                                   toggleMute: { model.toggleMute(forTab: tab) })
-                    BalanceControl(value: route.balance) { model.setBalance($0, forTab: tab) }
                 }
                 .padding(.leading, 21)
             }
@@ -416,6 +426,40 @@ struct HeadphonesQualityToggle: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+}
+
+/// Right-click menu for an app row.
+struct AppRowMenu: View {
+    @EnvironmentObject var model: AudioModel
+    let app: AudioApp
+
+    var body: some View {
+        Button(model.pinnedApps[app.id] != nil ? "Unpin" : "Pin to Top") { model.togglePin(app) }
+        Button("Equalizer…") { UIState.shared.expanded.insert(app.id); UIState.shared.eqTarget = "app:" + app.id }
+        Divider()
+        Button("Reset to Mac Default") { model.removeRule(app.id) }.disabled(model.rules[app.id] == nil)
+        Button("Ignore \(app.name)") { model.setIgnored(true, id: app.id, name: app.name) }
+    }
+}
+
+/// "Equalizer" button that opens an EQ popover.
+struct EQButton<Content: View>: View {
+    @EnvironmentObject var ui: UIState
+    let active: Bool
+    let key: String
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        Button { ui.eqTarget = key } label: {
+            Label(active ? "Equalizer: on" : "Equalizer…", systemImage: "slider.vertical.3")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(active ? Color.accentColor : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: Binding(get: { ui.eqTarget == key }, set: { if !$0 { ui.eqTarget = nil } }), arrowEdge: .trailing) {
+            content()
         }
     }
 }

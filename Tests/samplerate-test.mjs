@@ -81,6 +81,8 @@ check(c2.underruns - c1.underruns > 0 || c2.skips - c1.skips > 0,
   `control: a stream left at the wrong rate is detected (skips +${c2.skips - c1.skips}, underruns +${c2.underruns - c1.underruns})`);
 
 running = false;
+ws.send(JSON.stringify({ type: 'forgetSite', host: 'x' }));   // leave no remembered test site behind
+await sleep(300);
 ws.close();
 setrate(original);
 console.log(`restored ${DEVICE} to ${setrate()} Hz`);

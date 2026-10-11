@@ -195,6 +195,7 @@ final class TabPlayer: @unchecked Sendable {
         }
         for i in (got * 2)..<(frames * 2) { scratch[i] = 0 }
 
+        state.eq.process(scratch, frames: frames)
         delayLine.process(scratch, frames: frames, delay: state.delayFrames)
         DSP.write(scratch, frames: frames, to: output, state: state)
     }

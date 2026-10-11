@@ -241,37 +241,14 @@ struct VolumeControl: View {
     private func snap(_ v: Float) -> Float { boost && abs(v - 1) < 0.04 ? 1 : v }
 }
 
-/// Left/right balance, -1 … +1, snapping to the centre.
-struct BalanceControl: View {
-    let value: Float
-    let setValue: (Float) -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text("L").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).frame(width: 16)
-            Slider(value: Binding(get: { Double(value) }, set: { v in setValue(abs(Float(v)) < 0.06 ? 0 : Float(v)) }), in: -1...1)
-                .labelsHidden()
-                .controlSize(.mini)
-                .frame(maxWidth: .infinity)
-            Text("R").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
-            Text(label).font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
-                .frame(width: 32, alignment: .trailing)
-        }
-        .help("Balance")
-    }
-
-    private var label: String {
-        if abs(value) < 0.01 { return "C" }
-        return (value < 0 ? "L" : "R") + "\(Int((abs(value) * 100).rounded()))"
-    }
-}
-
 /// UI-only state shared by the panel and the window.
 final class UIState: ObservableObject {
     static let shared = UIState()
     @Published var expanded: Set<String> = []
     @Published var showOtherApps = false
     @Published var section: SidebarSection? = .apps
+    /// Which row's EQ popover is open ("app:<id>" / "spk:<uid>").
+    @Published var eqTarget: String?
 
     func toggle(_ id: String) {
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }

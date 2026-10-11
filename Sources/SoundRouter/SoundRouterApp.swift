@@ -61,9 +61,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         model.onShortcutsChanged = { MainActor.assumeIsolated { registerShortcuts() } }
         registerShortcuts()
+        let testing = CommandLine.arguments.contains { $0.hasPrefix("--") && $0.hasSuffix("test") || $0 == "--snapshot" }
+        if !Welcome.hasBeenShown && !testing { Welcome.show() }
         if let i = CommandLine.arguments.firstIndex(of: "--fullscreentest"), CommandLine.arguments.indices.contains(i + 2) {
             let (path, helper) = (CommandLine.arguments[i + 1], CommandLine.arguments[i + 2])
             Task { @MainActor in try? await Task.sleep(for: .seconds(1)); await FullScreenTest.run(path, helper: helper, delegate: self) }
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--feature2test"), CommandLine.arguments.indices.contains(i + 1) {
+            let path = CommandLine.arguments[i + 1]
+            Task { @MainActor in try? await Task.sleep(for: .seconds(1.5)); await FeatureTest2.run(path) }
         }
         if let i = CommandLine.arguments.firstIndex(of: "--featuretest"), CommandLine.arguments.indices.contains(i + 1) {
             let path = CommandLine.arguments[i + 1]
@@ -109,6 +115,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as? NSWindow) === mainWindow else { return }
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// `soundrouter://` links.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            AudioModel.shared.handle(url, openPanel: { [weak self] in self?.statusBar?.toggle() },
+                                     openWindow: { [weak self] in self?.showMainWindow() })
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

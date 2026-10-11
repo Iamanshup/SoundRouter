@@ -77,7 +77,7 @@ final class TapRouter {
     }
 
     /// Real-time: gather the tapped stereo mix, delay it if asked, then write it out
-    /// with gain, balance and limiting. Handles interleaved and non-interleaved input.
+    /// with gain and limiting. Handles interleaved and non-interleaved input.
     private func render(input: UnsafePointer<AudioBufferList>, output: UnsafeMutablePointer<AudioBufferList>) {
         let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outs = UnsafeMutableAudioBufferListPointer(output)
@@ -114,6 +114,7 @@ final class TapRouter {
         for i in (got * 2)..<(frames * 2) { scratch[i] = 0 }
         if got < frames { state.shortCallbacks &+= 1 }
 
+        state.eq.process(scratch, frames: frames)
         delayLine.process(scratch, frames: frames, delay: state.delayFrames)
         DSP.write(scratch, frames: frames, to: output, state: state)
         _ = outs

@@ -13,15 +13,15 @@ struct AppRule: Codable, Equatable {
     var name: String?
     /// Further speakers that play the same audio.
     var extraDeviceUIDs: [String]?
-    /// -1 (left) … 0 … +1 (right).
-    var balance: Float?
+    /// 10-band EQ gains in dB (nil = off).
+    var eq: [Double]?
 
     var extras: [String] { extraDeviceUIDs ?? [] }
-    var pan: Float { balance ?? 0 }
+    var hasEQ: Bool { (eq ?? []).contains { abs($0) > 0.05 } }
 
     /// Nothing to do: plays on the Mac default, untouched.
     var isNeutral: Bool {
-        deviceUID == nil && abs(volume - 1) < 0.001 && !muted && extras.isEmpty && abs(pan) < 0.001
+        deviceUID == nil && abs(volume - 1) < 0.001 && !muted && extras.isEmpty && !hasEQ
     }
 }
 
@@ -30,7 +30,6 @@ struct TabRoute: Equatable {
     var deviceUID: String
     var extras: [String] = []
     var volume: Float = 1
-    var balance: Float = 0
     var muted = false
 }
 
@@ -99,6 +98,33 @@ final class AudioModel: ObservableObject {
             onShortcutsChanged?()
         }
     }
+    // Lower other apps during calls.
+    @Published var duckingEnabled = UserDefaults.standard.object(forKey: "duckingEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(duckingEnabled, forKey: "duckingEnabled"); reconcile(); applyTabGains() }
+    }
+    /// Level other apps drop to during a call (0…1).
+    @Published var duckLevel: Float = UserDefaults.standard.object(forKey: "duckLevel") as? Float ?? 0.2 {
+        didSet { UserDefaults.standard.set(duckLevel, forKey: "duckLevel"); applyGains(); applyTabGains() }
+    }
+    /// Apps using the mic right now (rule keys), i.e. probably in a call.
+    @Published private(set) var callApps: Set<String> = []
+    var isInCall: Bool { !callApps.isEmpty }
+    /// For tests: pretend these apps are in a call.
+    var simulatedCallApps: Set<String>? { didSet { updateCallState() } }
+
+    // Speaker EQ: graphic gains and an optional correction profile, per speaker uid.
+    @Published private(set) var speakerEQ: [String: [Double]] = AudioModel.load("speakerEQ") ?? [:]
+    @Published private(set) var speakerProfiles: [String: CorrectionProfile] = AudioModel.load("speakerProfiles") ?? [:]
+
+    // Pinned (always listed) and ignored (never touched) apps: rule key -> name.
+    @Published private(set) var pinnedApps: [String: String] = UserDefaults.standard.dictionary(forKey: "pinnedApps") as? [String: String] ?? [:]
+    @Published private(set) var ignoredApps: [String: String] = UserDefaults.standard.dictionary(forKey: "ignoredApps") as? [String: String] ?? [:]
+
+    /// What the volume/mute shortcuts act on: "playing" (the app making sound) or "front".
+    @Published var shortcutTarget = UserDefaults.standard.string(forKey: "shortcutTarget") ?? "playing" {
+        didSet { UserDefaults.standard.set(shortcutTarget, forKey: "shortcutTarget") }
+    }
+
     /// Names of every speaker seen, so automations can target ones that aren't connected now.
     @Published private(set) var knownDevices: [String: String] = UserDefaults.standard.dictionary(forKey: "knownDevices") as? [String: String] ?? [:]
     var onShortcutsChanged: (() -> Void)?
@@ -186,10 +212,17 @@ final class AudioModel: ObservableObject {
 
     /// Apps worth showing up front: playing, routed / customised, or with tabs playing or routed.
     var nowPlaying: [AudioApp] {
-        visibleApps.filter { app in
-            app.isPlaying || rules[app.id] != nil
+        let live = visibleApps.filter { app in
+            app.isPlaying || rules[app.id] != nil || pinnedApps[app.id] != nil
                 || (isBrowser(app) && tabs(for: app).contains { $0.audible || tabRoutes[$0.id] != nil })
         }
+        // Pinned apps that aren't using audio yet still get a row, so they can be set up in advance.
+        let present = Set(apps.map(\.id))
+        let waiting = pinnedApps.filter { !present.contains($0.key) && ignoredApps[$0.key] == nil }
+            .sorted { $0.value.localizedCaseInsensitiveCompare($1.value) == .orderedAscending }
+            .map { AudioApp(id: $0.key, name: $0.value, pid: 0, processObjects: [], isPlaying: false, isRegularApp: true) }
+        // Pinned first, then the rest.
+        return live.filter { pinnedApps[$0.id] != nil } + waiting + live.filter { pinnedApps[$0.id] == nil }
     }
 
     var otherApps: [AudioApp] {
@@ -198,13 +231,13 @@ final class AudioModel: ObservableObject {
     }
 
     var visibleApps: [AudioApp] {
-        apps.filter { showBackgroundProcesses || $0.isRegularApp || $0.isPlaying || rules[$0.id] != nil }
+        apps.filter { ignoredApps[$0.id] == nil && (showBackgroundProcesses || $0.isRegularApp || $0.isPlaying || rules[$0.id] != nil) }
     }
 
     /// Rules for apps that aren't currently running, so they can still be edited / removed.
     var dormantRules: [(String, AppRule)] {
         let running = Set(apps.map(\.id))
-        return rules.filter { !running.contains($0.key) }.sorted { $0.key < $1.key }
+        return rules.filter { !running.contains($0.key) && pinnedApps[$0.key] == nil }.sorted { $0.key < $1.key }
     }
 
     func rule(for appID: String) -> AppRule { rules[appID] ?? AppRule() }
@@ -233,8 +266,26 @@ final class AudioModel: ObservableObject {
         updateRule(app.id, name: app.name) { $0.muted.toggle() }
     }
 
-    func setBalance(_ balance: Float, for app: AudioApp) {
-        updateRule(app.id, name: app.name) { $0.balance = abs(balance) < 0.04 ? nil : balance }
+    func setEQ(_ gains: [Double]?, for app: AudioApp) {
+        updateRule(app.id, name: app.name) { $0.eq = (gains ?? []).contains { abs($0) > 0.05 } ? gains : nil }
+    }
+
+    func togglePin(_ app: AudioApp) {
+        if pinnedApps[app.id] != nil { pinnedApps[app.id] = nil } else { pinnedApps[app.id] = app.name }
+        UserDefaults.standard.set(pinnedApps, forKey: "pinnedApps")
+    }
+
+    /// Pin a running app by bundle id (from the "Pin an app" menu).
+    func pin(id: String, name: String) {
+        pinnedApps[id] = name
+        UserDefaults.standard.set(pinnedApps, forKey: "pinnedApps")
+    }
+
+    func setIgnored(_ ignored: Bool, id: String, name: String) {
+        ignoredApps[id] = ignored ? name : nil
+        if ignored { pinnedApps[id] = nil; UserDefaults.standard.set(pinnedApps, forKey: "pinnedApps") }
+        UserDefaults.standard.set(ignoredApps, forKey: "ignoredApps")
+        reconcile()
     }
 
     /// Adds or removes an extra speaker for an app.
@@ -299,10 +350,30 @@ final class AudioModel: ObservableObject {
         scheduleRefresh()
     }
 
-    func setBalance(_ value: Float, for device: OutputDevice) {
-        DeviceManager.setBalance(device.id, value)
-        if let i = devices.firstIndex(where: { $0.id == device.id }) { devices[i].balance = value }
+    func setEQ(_ gains: [Double]?, for device: OutputDevice) {
+        speakerEQ[device.uid] = (gains ?? []).contains { abs($0) > 0.05 } ? gains : nil
+        store(speakerEQ, "speakerEQ")
+        reconcile()
+        reconcileTabs()
     }
+
+    func setProfile(_ profile: CorrectionProfile?, for device: OutputDevice) {
+        speakerProfiles[device.uid] = profile
+        store(speakerProfiles, "speakerProfiles")
+        reconcile()
+        reconcileTabs()
+    }
+
+    func hasEQ(_ uid: String) -> Bool { speakerProfiles[uid] != nil || (speakerEQ[uid] ?? []).contains { abs($0) > 0.05 } }
+
+    /// Correction profiles that ship with the app (from AutoEq).
+    static let bundledProfiles: [CorrectionProfile] = {
+        guard let dir = Bundle.main.url(forResource: "CorrectionProfiles", withExtension: nil),
+              let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
+        return files.filter { $0.pathExtension == "txt" && !$0.lastPathComponent.hasPrefix("LICENSE") }
+            .compactMap { url in (try? String(contentsOf: url, encoding: .utf8)).flatMap { CorrectionProfile.parse($0, name: url.deletingPathExtension().lastPathComponent) } }
+            .sorted { $0.name < $1.name }
+    }()
 
     func setDelay(_ ms: Float, for device: OutputDevice) {
         speakerDelays[device.uid] = ms < 1 ? nil : ms
@@ -452,22 +523,31 @@ final class AudioModel: ObservableObject {
         HUD.show("Mac default: \(next.name)", symbol: next.symbol)
     }
 
-    /// The app in front, as a rule key and display name.
-    private func frontmostApp() -> (id: String, name: String)? {
-        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
-              let id = app.bundleIdentifier else { return nil }
-        return (id, app.localizedName ?? id)
+    /// The app the volume/mute shortcuts act on, as a rule key and display name.
+    func shortcutTargetApp() -> (id: String, name: String)? {
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontID = front.flatMap { $0.processIdentifier == getpid() ? nil : $0.bundleIdentifier }
+        if shortcutTarget == "playing" {
+            // Apps that keep an audio channel open while silent count as "playing" too, so prefer
+            // the app in front if it's playing, otherwise the one that most recently started.
+            let playing = visibleApps.filter { $0.isPlaying && !callApps.contains($0.id) }
+                .sorted { (playStarts[$0.id] ?? .distantPast) > (playStarts[$1.id] ?? .distantPast) }
+            if let id = frontID, let app = playing.first(where: { $0.id == id }) { return (app.id, app.name) }
+            if let app = playing.first { return (app.id, app.name) }
+        }
+        guard let id = frontID else { return nil }
+        return (id, front?.localizedName ?? id)
     }
 
     func toggleMuteFrontmost() {
-        guard let (id, name) = frontmostApp() else { return }
+        guard let (id, name) = shortcutTargetApp() else { return }
         updateRule(id, name: name) { $0.muted.toggle() }
         let muted = rules[id]?.muted ?? false
         HUD.show("\(name) \(muted ? "muted" : "unmuted")", symbol: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
     }
 
     func nudgeFrontmostVolume(by delta: Float) {
-        guard let (id, name) = frontmostApp() else { return }
+        guard let (id, name) = shortcutTargetApp() else { return }
         updateRule(id, name: name) { rule in
             rule.volume = max(0, min(2, ((rule.volume + delta) * 10).rounded() / 10))
             rule.muted = false
@@ -539,9 +619,47 @@ final class AudioModel: ObservableObject {
         updateDevices(DeviceManager.outputDevices(softwareVolumes: softwareVolumes))
         enforceAlerts()
         apps = ProcessManager.audioApps()
+        updateCallState()
         reconcile()
         reconcileTabs()
     }
+
+    /// When each app last started playing; shortcuts act on the most recent one.
+    private var playStarts: [String: Date] = [:]
+
+    private func notePlayStarts() {
+        let now = Date()
+        for app in apps where app.isPlaying && playStarts[app.id] == nil { playStarts[app.id] = now }
+        let playing = Set(apps.filter(\.isPlaying).map(\.id))
+        for id in playStarts.keys where !playing.contains(id) { playStarts[id] = nil }
+    }
+
+    /// A regular app (not a background helper like Siri's listener) using the mic means a call.
+    private func updateCallState() {
+        notePlayStarts()
+        let now = simulatedCallApps ?? Set(apps.filter { $0.isRecording && $0.isRegularApp && ignoredApps[$0.id] == nil }.map(\.id))
+        guard now != callApps else { return }
+        let started = callApps.isEmpty && !now.isEmpty
+        callApps = now
+        if started && duckingEnabled {
+            HUD.show("Call detected: other apps lowered to \(Int((duckLevel * 100).rounded()))%", symbol: "phone.fill")
+        }
+        reconcile()
+        applyTabGains()
+    }
+
+    /// Whether an app is turned down because of a call.
+    func isDucked(_ app: AudioApp) -> Bool {
+        duckingEnabled && isInCall && !callApps.contains(app.id) && ignoredApps[app.id] == nil && app.isPlaying
+    }
+
+    private func duckFactor(appID: String) -> Float {
+        guard let app = apps.first(where: { $0.id == appID }), isDucked(app) else { return 1 }
+        return duckLevel
+    }
+
+    /// Hosts whose tabs are the call itself, so they're never lowered.
+    private static let callHosts = ["meet.google.com", "zoom.us", "teams.microsoft.com", "teams.live.com", "app.slack.com", "discord.com", "whereby.com"]
 
     /// Records names and colours, and fires connect/disconnect automations.
     private func updateDevices(_ fresh: [OutputDevice]) {
@@ -572,6 +690,7 @@ final class AudioModel: ObservableObject {
         let freshApps = ProcessManager.audioApps()
         if freshApps != apps {
             apps = freshApps
+            updateCallState()
             reconcile()
         }
         var newLevels: [String: Float] = [:]
@@ -587,15 +706,27 @@ final class AudioModel: ObservableObject {
     }
 
     /// The speakers SoundRouter should play an app on; empty to leave the app alone.
-    private func targets(for rule: AppRule) -> [OutputDevice] {
+    private func targets(for rule: AppRule, appID: String = "") -> [OutputDevice] {
         let base = device(rule.deviceUID) ?? defaultDevice
         let extras = rule.extras.compactMap(device).filter { $0.uid != base?.uid }
         guard let base else { return [] }
         if !extras.isEmpty { return physical([base] + extras) }
         if !base.isDefault { return physical([base]) }
-        // On the Mac default: only intercept to apply volume, mute or balance.
-        let needsProcessing = abs(rule.volume - 1) > 0.001 || rule.muted || abs(rule.pan) > 0.001
+        // On the Mac default: only intercept to apply volume, mute, EQ or ducking.
+        let playing = apps.first { $0.id == appID }?.isPlaying ?? false
+        let needsProcessing = abs(rule.volume - 1) > 0.001 || rule.muted || rule.hasEQ
+            || duckFactor(appID: appID) < 1 || (playing && hasEQ(base.uid))
         return needsProcessing ? physical([base]) : []
+    }
+
+    /// The filter chain for audio on a speaker: its correction profile and EQ, then the app's EQ.
+    private func eqChain(appEQ: [Double]?, on device: OutputDevice) -> (bands: [EQBand], preamp: Double) {
+        var bands: [EQBand] = []
+        var preamp = 0.0
+        if let profile = speakerProfiles[device.uid] { bands += profile.bands; preamp += profile.preamp }
+        if let gains = speakerEQ[device.uid] { bands += GraphicEQ.bands(gains); preamp += GraphicEQ.preamp(gains) }
+        if let gains = appEQ, gains.contains(where: { abs($0) > 0.05 }) { bands += GraphicEQ.bands(gains); preamp += GraphicEQ.preamp(gains) }
+        return (bands, preamp)
     }
 
     /// Multi-output / aggregate devices can't be nested inside our routing device, so play on
@@ -618,11 +749,18 @@ final class AudioModel: ObservableObject {
         return g
     }
 
-    private func configure(_ state: IOState, volume: Float, muted: Bool, balance: Float, on device: OutputDevice, multi: Bool) {
-        state.gain = gain(volume: volume, muted: muted, on: device)
-        state.balance = balance
+    private func configure(_ state: IOState, volume: Float, muted: Bool, on device: OutputDevice, multi: Bool,
+                           duck: Float = 1, appEQ: [Double]? = nil) {
+        state.gain = gain(volume: volume, muted: muted, on: device) * duck
         let rate = CA.get(device.id, address(kAudioDevicePropertyNominalSampleRate), Float64(0)) ?? 48000
         state.delayFrames = multi ? Int(Double(delay(for: device.uid)) / 1000 * rate) : 0
+        let chain = eqChain(appEQ: appEQ, on: device)
+        let signature = "\(chain.bands)|\(chain.preamp)|\(rate)"
+        if signature != state.eqSignature {
+            state.eqSignature = signature
+            state.eq.set(chain.bands, preampDB: chain.preamp, sampleRate: rate)
+        }
+        state.limit = chain.bands.contains { $0.gain > 0 }
     }
 
     private func retire(_ router: TapRouter?) {
@@ -638,21 +776,24 @@ final class AudioModel: ObservableObject {
     private func reconcile() {
         var wanted: Set<String> = []
         var errors: [String: String] = [:]
-        for app in apps {
-            guard let rule = rules[app.id] else { continue }
-            let targets = targets(for: rule)
+        for app in apps where ignoredApps[app.id] == nil {
+            let rule = rules[app.id] ?? AppRule()
+            let targets = targets(for: rule, appID: app.id)
             let objects = app.processObjects.sorted()
+            let duck = duckFactor(appID: app.id)
             for device in targets {
                 let key = app.id + "|" + device.uid
                 wanted.insert(key)
                 if let existing = routers[key], existing.processObjects == objects {
-                    configure(existing.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+                    configure(existing.state, volume: rule.volume, muted: rule.muted, on: device, multi: targets.count > 1,
+                              duck: duck, appEQ: rule.eq)
                     continue
                 }
                 retire(routers.removeValue(forKey: key))
                 do {
                     let router = try TapRouter(name: app.name, processObjects: objects, deviceUID: device.uid, gain: 0)
-                    configure(router.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+                    configure(router.state, volume: rule.volume, muted: rule.muted, on: device, multi: targets.count > 1,
+                              duck: duck, appEQ: rule.eq)
                     routers[key] = router
                 } catch {
                     errors[app.id] = "\(error)"
@@ -667,12 +808,13 @@ final class AudioModel: ObservableObject {
     }
 
     private func applyGains() {
-        for app in apps {
-            guard let rule = rules[app.id] else { continue }
-            let targets = targets(for: rule)
+        for app in apps where ignoredApps[app.id] == nil {
+            let rule = rules[app.id] ?? AppRule()
+            let targets = targets(for: rule, appID: app.id)
             for device in targets {
                 guard let router = routers[app.id + "|" + device.uid] else { continue }
-                configure(router.state, volume: rule.volume, muted: rule.muted, balance: rule.pan, on: device, multi: targets.count > 1)
+                configure(router.state, volume: rule.volume, muted: rule.muted, on: device, multi: targets.count > 1,
+                          duck: duckFactor(appID: app.id), appEQ: rule.eq)
             }
         }
     }
@@ -736,11 +878,6 @@ final class AudioModel: ObservableObject {
         rememberSite(for: tab)
         applyTabGains()
         broadcastState()
-    }
-
-    func setBalance(_ balance: Float, forTab tab: BrowserTab) {
-        tabRoutes[tab.id]?.balance = abs(balance) < 0.04 ? 0 : balance
-        applyTabGains()
     }
 
     func toggleMute(forTab tab: BrowserTab) {
@@ -887,14 +1024,16 @@ final class AudioModel: ObservableObject {
                 wantedPlayers.insert(pkey)
                 let rate = CA.get(device.id, address(kAudioDevicePropertyNominalSampleRate), Float64(0))
                 if let existing = tabPlayers[pkey], rate == nil || rate == existing.sampleRate {
-                    configure(existing.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+                    configure(existing.state, volume: route.volume, muted: route.muted, on: device, multi: targets.count > 1,
+                              duck: tabDuck(tab))
                     players.append(existing)
                     continue
                 }
                 retire(tabPlayers.removeValue(forKey: pkey))
                 do {
                     let player = try TabPlayer(device: device, gain: 0)
-                    configure(player.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+                    configure(player.state, volume: route.volume, muted: route.muted, on: device, multi: targets.count > 1,
+                              duck: tabDuck(tab))
                     // Rebuild at the new rate; the extension re-renders the same tab stream to match.
                     player.onSampleRateChange = { [weak self] in MainActor.assumeIsolated { self?.reconcileTabs() } }
                     tabPlayers[pkey] = player
@@ -932,11 +1071,19 @@ final class AudioModel: ObservableObject {
     private func applyTabGains() {
         for (key, route) in tabRoutes {
             let targets = tabTargets(route)
+            let tab = tabs.first { $0.id == key }
             for device in targets {
                 guard let player = tabPlayers[key + "|" + device.uid] else { continue }
-                configure(player.state, volume: route.volume, muted: route.muted, balance: route.balance, on: device, multi: targets.count > 1)
+                configure(player.state, volume: route.volume, muted: route.muted, on: device, multi: targets.count > 1,
+                          duck: tab.map(tabDuck) ?? 1)
             }
         }
+    }
+
+    /// Routed tabs are lowered during a call too, unless the tab is the call.
+    func tabDuck(_ tab: BrowserTab) -> Float {
+        guard duckingEnabled, isInCall, let host = Self.host(of: tab.url) else { return 1 }
+        return Self.callHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) }) ? 1 : duckLevel
     }
 
     /// Devices and current tab routes, for the extension's popup.

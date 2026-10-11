@@ -68,6 +68,7 @@ struct AppsPage: View {
                     } header: {
                         HStack {
                             Text("Other Apps")
+                            PinAppButton().padding(.leading, 8)
                             Spacer()
                             Toggle("Show background processes", isOn: $model.showBackgroundProcesses)
                                 .toggleStyle(.checkbox).font(.system(size: 11))
@@ -132,7 +133,7 @@ struct SpeakersPage: View {
                 Section {
                     ForEach(model.devices) { SpeakerRow(device: $0).padding(.vertical, 3) }
                 } footer: {
-                    Text("Expand a speaker for balance and sync delay.").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("Expand a speaker for sync delay and the equalizer.").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Section { AlertsRow() }
             }
@@ -168,17 +169,55 @@ struct SettingsPage: View {
             Form {
                 Section("General") {
                     Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
+                    Button("Show Welcome Guide") { Welcome.show() }
                     Toggle("Show background processes in the app list", isOn: $model.showBackgroundProcesses)
                 }
-                Section("Keyboard Shortcuts") {
+                Section("Calls") {
+                    Toggle("Lower other apps during calls", isOn: $model.duckingEnabled)
+                    if model.duckingEnabled {
+                        HStack {
+                            Text("Lower to")
+                            Slider(value: Binding(get: { Double(model.duckLevel) }, set: { model.duckLevel = Float(($0 * 20).rounded() / 20) }), in: 0...0.8)
+                            Text("\(Int((model.duckLevel * 100).rounded()))%").monospacedDigit().frame(width: 40, alignment: .trailing)
+                        }
+                        Text("A call is any app using the microphone (Zoom, FaceTime, Meet in a browser…). The call app itself isn’t lowered.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                Section {
                     Toggle("Enable keyboard shortcuts", isOn: $model.shortcutsEnabled)
                     if model.shortcutsEnabled {
-                        ShortcutRow(keys: "S", title: "Switch the Mac default speaker")
-                        ShortcutRow(keys: "M", title: "Mute or unmute the app in front")
-                        ShortcutRow(keys: "↑ / ↓", title: "Louder / quieter: the app in front (up to 200%)")
-                        ShortcutRow(keys: "1 – 9", title: "Apply preset 1 to 9")
-                        ShortcutRow(keys: "0", title: "Open the SoundRouter panel")
+                        Picker("Mute, louder and quieter act on", selection: $model.shortcutTarget) {
+                            Text("The app playing sound").tag("playing")
+                            Text("The app in front").tag("front")
+                        }
+                        ForEach(HotKeys.Action.allCases) { ShortcutRecorderRow(action: $0) }
+                        ShortcutRow(keys: HotKeys.modifierLabel + "1 – 9", title: "Apply preset 1 to 9")
+                        Button("Restore Default Shortcuts") { HotKeys.shared.resetToDefaults() }
                     }
+                } header: {
+                    Text("Keyboard Shortcuts")
+                } footer: {
+                    Text("Click a shortcut and press new keys. Delete removes it, Esc cancels.").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                if !model.ignoredApps.isEmpty {
+                    Section("Ignored Apps") {
+                        ForEach(model.ignoredApps.sorted { $0.value < $1.value }, id: \.key) { id, name in
+                            HStack {
+                                Text(name)
+                                Spacer()
+                                Button("Stop Ignoring") { model.setIgnored(false, id: id, name: name) }
+                            }
+                        }
+                    }
+                }
+                Section {
+                    ForEach(AutomationLink.examples, id: \.url) { AutomationLinkRow(link: $0) }
+                } header: {
+                    Text("Automation Links")
+                } footer: {
+                    Text("Use these in the Shortcuts app (“Open URLs” action), Focus mode shortcuts, Stream Deck, Raycast or scripts (open \"soundrouter://…\"). Replace the names with your own.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Section("Browser Tabs") {
                     ExtensionSetup()
@@ -278,7 +317,7 @@ struct PresetsPage: View {
                 } header: {
                     Text("Presets")
                 } footer: {
-                    Text("A preset stores every app’s speaker, volume and balance, the Mac default speaker and the alerts speaker.")
+                    Text("A preset stores every app’s speaker, volume and EQ, the Mac default speaker and the alerts speaker.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Section {
@@ -401,5 +440,61 @@ struct AutomationRow: View {
             updated.deviceName = model.deviceName(updated.deviceUID)
             model.updateAutomation(updated)
         })
+    }
+}
+
+struct ShortcutRecorderRow: View {
+    @ObservedObject var hotkeys = HotKeys.shared
+    let action: HotKeys.Action
+
+    var body: some View {
+        HStack {
+            Text(action.title)
+            Spacer()
+            Button {
+                if hotkeys.recording == action { hotkeys.stopRecording() } else { hotkeys.startRecording(action) }
+            } label: {
+                Text(hotkeys.recording == action ? "Press keys…" : (hotkeys.combo(for: action)?.label ?? "None"))
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(hotkeys.recording == action ? Color.accentColor : Color.primary)
+                    .frame(minWidth: 80)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(hotkeys.recording == action ? Color.accentColor.opacity(0.15) : Color.primary.opacity(0.07)))
+            }
+            .buttonStyle(.plain)
+            .help("Click, then press the new shortcut")
+        }
+    }
+}
+
+struct AutomationLink {
+    let url: String
+    let title: String
+
+    static let examples = [
+        AutomationLink(url: "soundrouter://preset/Work", title: "Apply a preset (name or number)"),
+        AutomationLink(url: "soundrouter://speaker/AirPods", title: "Make a speaker the Mac default"),
+        AutomationLink(url: "soundrouter://app/Spotify?speaker=WH-1000XM5&volume=80", title: "Set an app’s speaker and volume"),
+        AutomationLink(url: "soundrouter://app/Music?mute=toggle", title: "Mute or unmute an app"),
+        AutomationLink(url: "soundrouter://alerts/MacBook", title: "Choose the alerts speaker"),
+        AutomationLink(url: "soundrouter://ducking/toggle", title: "Lower apps during calls: on, off, toggle"),
+    ]
+}
+
+struct AutomationLinkRow: View {
+    let link: AutomationLink
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(link.title)
+                Text(link.url).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Spacer()
+            Button("Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(link.url, forType: .string)
+            }
+        }
     }
 }

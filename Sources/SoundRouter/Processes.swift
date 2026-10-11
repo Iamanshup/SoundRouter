@@ -10,9 +10,14 @@ struct AudioApp: Identifiable, Hashable {
     var processObjects: [AudioObjectID]
     var isPlaying: Bool
     var isRegularApp: Bool
+    /// Using a microphone (or other input) right now, e.g. in a call.
+    var isRecording = false
 
     var icon: NSImage? {
-        NSRunningApplication(processIdentifier: pid)?.icon
+        if pid > 0, let icon = NSRunningApplication(processIdentifier: pid)?.icon { return icon }
+        // Pinned apps that aren't running.
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return nil }
+        return NSWorkspace.shared.icon(forFile: url.path)
     }
 }
 
@@ -45,6 +50,7 @@ enum ProcessManager {
         for obj in objects {
             guard let pid = CA.get(obj, address(kAudioProcessPropertyPID), pid_t(0)), pid > 0, pid != me else { continue }
             let playing = (CA.get(obj, address(kAudioProcessPropertyIsRunningOutput), UInt32(0)) ?? 0) != 0
+            let recording = (CA.get(obj, address(kAudioProcessPropertyIsRunningInput), UInt32(0)) ?? 0) != 0
             let ownerPID = responsiblePID(pid)
             guard ownerPID != me else { continue }
             let owner = NSRunningApplication(processIdentifier: ownerPID) ?? NSRunningApplication(processIdentifier: pid)
@@ -55,11 +61,12 @@ enum ProcessManager {
             if var existing = apps[key] {
                 existing.processObjects.append(obj)
                 existing.isPlaying = existing.isPlaying || playing
+                existing.isRecording = existing.isRecording || recording
                 apps[key] = existing
             } else {
                 apps[key] = AudioApp(id: key, name: name.isEmpty ? key : name, pid: owner?.processIdentifier ?? ownerPID,
                                      processObjects: [obj], isPlaying: playing,
-                                     isRegularApp: owner?.activationPolicy == .regular)
+                                     isRegularApp: owner?.activationPolicy == .regular, isRecording: recording)
             }
         }
         return apps.values.sorted {

@@ -4,7 +4,7 @@
 #   INSTALL=0    only build build/SoundRouter.app, don't install it
 set -e
 cd "$(dirname "$0")"
-VERSION=1.1.1
+VERSION=1.2
 APP=build/SoundRouter.app
 
 if [[ "$UNIVERSAL" == 1 ]]; then
@@ -27,6 +27,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SoundRouter"
 cp -R BrowserExtension "$APP/Contents/Resources/BrowserExtension"
 cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp -R Resources/CorrectionProfiles "$APP/Contents/Resources/CorrectionProfiles"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -36,6 +37,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>SoundRouter</string>
   <key>CFBundleExecutable</key><string>SoundRouter</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>com.soundrouter.app</string>
+    <key>CFBundleURLSchemes</key><array><string>soundrouter</string></array>
+  </dict></array>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>1</string>

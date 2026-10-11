@@ -9,11 +9,16 @@ A macOS menu bar app that sends each app's sound, or even a single browser tab, 
 - **Per-app speaker:** route any app to any connected output (built-in, Bluetooth, AirPlay, USB, HDMI). Apps you don't touch keep following the **Mac default** speaker.
 - **Per-tab speaker:** with the companion browser extension, route individual Chrome, Brave or Edge tabs. A tab can go to a different speaker from the rest of the browser.
 - **Several speakers at once:** play an app or tab on more than one speaker ("Also Play On"), with a per-speaker **sync delay** to line up Bluetooth speakers. Multi-output devices are played through the real speakers inside them, so nothing doubles up.
-- **Volume everywhere:** a slider and mute for each speaker, each app and each routed tab. Apps and tabs go up to **200%** with a limiter, and have **left/right balance**. Speakers without a hardware volume (often HDMI) get a software volume.
+- **Volume everywhere:** a slider and mute for each speaker, each app and each routed tab. Apps and tabs go up to **200%** with a limiter. Speakers without a hardware volume (often HDMI) get a software volume.
 - **Alert sounds on their own speaker:** send notifications and system sounds to, say, the MacBook speakers while music plays on headphones.
-- **Presets:** save a whole setup (every app's speaker, volume and balance, the Mac default and the alerts speaker) and switch with one click or a shortcut.
+- **Presets:** save a whole setup (every app's speaker, volume and EQ, the Mac default and the alerts speaker) and switch with one click or a shortcut.
 - **Automation:** when a speaker connects or disconnects, make it the Mac default and/or apply a preset. Apps set to a speaker already move to it on their own whenever it connects.
-- **Keyboard shortcuts** (<kbd>⌃⌥⌘</kbd>): **S** switch the Mac default speaker, **M** mute the app in front, **↑/↓** louder/quieter for the app in front, **1–9** apply a preset, **0** open the panel. An on-screen notice confirms each one.
+- **Lower other apps during calls:** when an app starts using the mic (Zoom, FaceTime, Meet in a browser…), everything else fades down to a level you choose (20% by default) and comes back when the call ends.
+- **Equalizer:** a 10-band EQ with presets (Bass Boost, Vocal Clarity, Loudness…) for each app and each speaker. Speakers can also use **headphone correction profiles** from [AutoEQ](https://github.com/jaakkopasanen/AutoEq): Sony WH-1000XM5 and AirPods Pro (1st and 2nd generation) are built in, and any other profile from [autoeq.app](https://autoeq.app) can be imported.
+- **Keyboard shortcuts** (reassignable): by default <kbd>⌃⌥⌘</kbd> + **S** switch the Mac default speaker, **M** mute, **↑/↓** louder/quieter, **0** open the panel, **1–9** apply a preset. Mute and volume act on the app that's playing sound (or the app in front, if you prefer). An on-screen notice confirms each one.
+- **Pin and ignore apps:** pin an app to set it up before it plays; ignore an app so SoundRouter never touches it.
+- **Automation links:** `soundrouter://` links work from the Shortcuts app, Focus modes, Stream Deck, Raycast or scripts (see below).
+- **Welcome guide** on first launch (reopen it from the menu or Settings).
 - **Remembered websites:** a tab's speaker is remembered per site, so the next YouTube tab goes to the same speaker as soon as you click the extension.
 - **Microphones:** choose the Mac's mic, set input levels and mute.
 - **Keep headphones in high quality** (optional): if macOS switches the mic to Bluetooth headphones, which drops their playback to low-quality headset mode, SoundRouter switches it back to the Mac's mic.
@@ -73,6 +78,19 @@ Chrome only allows capturing a tab after you've clicked the extension once on th
 
 The extension needs the app running. If the app quits, captured tabs are released and play normally again.
 
+## Automation links
+
+| Link | Does |
+|---|---|
+| `soundrouter://preset/Work` | Apply a preset (by name or number) |
+| `soundrouter://speaker/AirPods` | Make a speaker the Mac default (name matching is forgiving) |
+| `soundrouter://app/Spotify?speaker=WH-1000XM5&volume=80&mute=0` | An app's speaker (`default` = Mac default), volume (0–200) and mute (`0`, `1`, `toggle`) |
+| `soundrouter://alerts/MacBook` | Alerts speaker (`default` = follow the Mac default) |
+| `soundrouter://ducking/toggle` | Lower apps during calls: `on`, `off`, `toggle` |
+| `soundrouter://panel`, `soundrouter://window` | Open the menu bar panel or the window |
+
+In the **Shortcuts** app, use the *Open URLs* action with one of these links. From Terminal: `open "soundrouter://preset/Work"`. (Native Shortcuts actions would need full Xcode to build, so SoundRouter uses links instead.)
+
 ## How it works
 
 ```
@@ -88,6 +106,8 @@ The extension needs the app running. If the app quits, captured tabs are release
 - **Per-app routing** uses Core Audio *process taps* (`CATapDescription`, macOS 14.2+). For each routed app SoundRouter taps its processes, grouped by "responsible" app so that browser helpers belong to the browser. The tap mutes the app's normal output only while SoundRouter reads it, so audio comes back if SoundRouter quits. A private aggregate device pairs the tap with the target speaker, and an IOProc copies the audio across with gain applied.
 - **Per-tab routing:** the extension captures the tab with `chrome.tabCapture` (which silences it in the browser), resamples it in an `AudioContext` to the speaker's sample rate, and streams 10 ms chunks of float PCM to the app over a local WebSocket. The app plays them through a lock-free ring buffer with a small jitter buffer (about 60 ms). Only `chrome-extension://` origins can connect, so web pages can't.
 - **Several speakers:** each speaker gets its own tap/aggregate (apps) or player (tabs); a browser tab is streamed once and resampled for speakers running at a different rate. Speakers can be delayed individually to line up.
+- **Calls:** SoundRouter watches which apps are using an input device (`kAudioProcessPropertyIsRunningInput`). A regular app recording means a call; other playing apps are routed through SoundRouter at the duck level, with gain changes ramped across each buffer so they fade. Background processes (e.g. Siri's listener) don't count.
+- **EQ:** biquad filters (RBJ cookbook) run on the real-time thread; new coefficients are published into a spare bank and swapped atomically, so the audio thread never waits. Speaker correction profile → speaker EQ → app EQ, with automatic headroom and the soft limiter.
 - **Sample-rate changes:** each tab player watches its speaker's nominal sample rate. When it changes, the app rebuilds the player and the extension re-renders the same captured stream at the new rate, with no extra click needed.
 
 ## Project layout
@@ -98,8 +118,11 @@ Sources/SoundRouter/
   AudioModel.swift          State and logic: rules, routing, tabs, mics, headphone guard, colours
   TapRouter.swift           Per-app routing (process tap → aggregate device → speaker)
   TabPlayer.swift           Per-tab playback (ring buffer, jitter buffer, resampling, sample-rate watch)
-  AudioDSP.swift            Shared real-time processing: gain, balance, limiter, delay line
-  HotKeys.swift, HUD.swift  Global shortcuts and the on-screen notice
+  AudioDSP.swift            Shared real-time processing: gain, limiter, delay line, EQ
+  HotKeys.swift, HUD.swift  Global shortcuts (reassignable) and the on-screen notice
+  EQView.swift              Equalizer editor and headphone-profile picker
+  Onboarding.swift          First-run welcome guide
+  URLCommands.swift         soundrouter:// automation links
   BrowserBridge.swift       Local WebSocket server for the extension
   Devices.swift             Speakers and microphones: listing, volume, mute, defaults
   Processes.swift           Which apps are using audio, grouped by responsible app
@@ -111,6 +134,7 @@ Sources/SoundRouter/
   SelfTest.swift            Built-in test and screenshot modes (see below)
 BrowserExtension/           Chrome MV3 extension (background, offscreen capture, worklet, popup)
 Icon/                       make-icon.swift renders the icon; AppIcon.icns is used by the build
+Resources/CorrectionProfiles/  Bundled AutoEQ headphone profiles (MIT, see LICENSE-AutoEq.txt)
 Tests/                      Integration tests (Node) and a sample-rate helper (Swift)
 build-app.sh                Build, bundle, sign and install
 make-dmg.sh                 Universal build packaged as a DMG
@@ -126,8 +150,9 @@ Run against the installed app. Launch through `open` so that macOS attributes th
 |---|---|
 | `open -W -n ~/Applications/SoundRouter.app --args --selftest /tmp/self.log` | Devices, speaker volume, per-app routing (tap → speaker), app volume and mute, speaker sample-rate switches. Plays a short spoken clip. `SR_DEVICE=<name>` picks the target speaker. |
 | `open -W -n --env SR_SIMULATE_BT_HEADSET="<mic name>" ~/Applications/SoundRouter.app --args --mictest /tmp/mic.log` | Mic listing and levels, and the "keep headphones in high quality" setting, using the named mic as a stand-in headset. |
-| `open -W -n ~/Applications/SoundRouter.app --args --featuretest /tmp/feature.log` | Alerts speaker, presets, automations (by creating and removing a temporary virtual speaker), shortcuts, boost, balance, multi-speaker capture, multi-output devices, tab resampling. |
+| `open -W -n ~/Applications/SoundRouter.app --args --featuretest /tmp/feature.log` | Alerts speaker, presets, automations (by creating and removing a temporary virtual speaker), shortcuts, boost, multi-speaker capture, multi-output devices, tab resampling. |
 | `swiftc Tests/fullscreen-helper.swift -o /tmp/fs-helper` then `open -W -n ~/Applications/SoundRouter.app --args --fullscreentest /tmp/fs.log /tmp/fs-helper` | The menu bar panel opens over a full-screen app (window open and closed) without switching Spaces. |
+| `open -W -n ~/Applications/SoundRouter.app --args --feature2test /tmp/feature2.log` | EQ filter response and profiles, call ducking (simulated call), EQ on live audio, pin/ignore, shortcut targets and reassignment, `soundrouter://` links. |
 | `…/SoundRouter --docktest /tmp/dock.log` | Closing the window hides the Dock icon; reopening from the menu bar restores it. |
 | `…/SoundRouter --menutest <dir>` | Opens the real menu bar panel and main window and saves light and dark screenshots. `SR_SECTION=apps\|speakers\|microphones\|settings`, `SR_EXPAND=<row id>`, `SR_LONG=1`. |
 
@@ -153,7 +178,10 @@ The sample-rate test switches the MacBook speakers between 48 kHz and 44.1 kHz a
 - Per-app *microphone* selection isn't supported. It would need a virtual audio driver. Call apps (Zoom, Meet, FaceTime) can pick their own mic.
 - Per-tab routing adds about 60 ms of latency (whole-app routing adds none), and needs one click on the extension per tab.
 - Remembered websites need one click on the extension per tab (Chrome's rule); they then apply automatically.
-- Keyboard shortcuts are fixed (<kbd>⌃⌥⌘</kbd> + key) and can be turned off in Settings, but not reassigned.
+- Preset shortcuts are fixed at <kbd>⌃⌥⌘</kbd> + 1–9; the others can be reassigned.
+- Call detection counts any regular app using the mic as a call (a voice memo app too). Apps that keep audio open while silent can be lowered unnecessarily; that's harmless.
+- A speaker's EQ only reaches apps SoundRouter routes; playing apps are routed automatically while it's on.
+- No native Shortcuts actions (they need Xcode to build); use `soundrouter://` links in Shortcuts instead.
 - Bluetooth headphones drop to headset quality whenever any app uses their mic. That's a Bluetooth limitation; the "keep headphones in high quality" setting helps avoid it.
 
 ## Troubleshooting
@@ -162,3 +190,7 @@ The sample-rate test switches the MacBook speakers between 48 kHz and 44.1 kHz a
 - **Extension says "SoundRouter isn't running":** open the app. The extension reconnects within a couple of seconds.
 - **Extension shows an error in `chrome://extensions`:** the folder it was loaded from probably moved. Remove it and load it again from `~/Library/Application Support/SoundRouter/BrowserExtension`.
 - **Port 47390 already in use:** another copy of SoundRouter is running. Quit it from the menu bar (… › Quit SoundRouter).
+
+## Credits
+
+Headphone correction profiles from [AutoEq](https://github.com/jaakkopasanen/AutoEq) by Jaakko Pasanen (MIT), with measurements by oratory1990 and crinacle.
