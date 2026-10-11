@@ -353,6 +353,7 @@ enum Prompt {
         field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
+        alert.window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
         NSApp.activate()
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -365,6 +366,7 @@ enum Prompt {
         alert.informativeText = message
         alert.addButton(withTitle: button)
         alert.addButton(withTitle: "Cancel")
+        alert.window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
         NSApp.activate()
         return alert.runModal() == .alertFirstButtonReturn
     }

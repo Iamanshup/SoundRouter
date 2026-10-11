@@ -639,3 +639,64 @@ enum SpawnDisclaimed {
         return pid
     }
 }
+
+/// `SoundRouter --fullscreentest <log> <helper binary>`: puts a helper app's window in full
+/// screen, then opens the menu bar panel on top of it, with SoundRouter's window open and closed.
+enum FullScreenTest {
+    @MainActor static func run(_ logPath: String, helper: String, delegate: AppDelegate) async {
+        var log = ""
+        var failures = 0
+        func say(_ s: String) { log += s + "\n"; print(s) }
+        func expect(_ ok: Bool, _ what: String) { say((ok ? "PASS " : "FAIL ") + what); if !ok { failures += 1 } }
+        func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
+
+        /// Is the helper's full-screen window on screen (i.e. we're still on its Space)?
+        func helperOnScreen(_ number: Int) -> Bool {
+            let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+            return list.contains { ($0[kCGWindowNumber as String] as? Int) == number }
+        }
+
+        let marker = NSTemporaryDirectory() + "soundrouter-fullscreen-\(getpid())"
+        try? FileManager.default.removeItem(atPath: marker)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helper)
+        process.arguments = [marker]
+        try? process.run()
+        var windowNumber: Int?
+        for _ in 0..<40 {
+            await wait(0.25)
+            if let s = try? String(contentsOfFile: marker, encoding: .utf8), let n = Int(s) { windowNumber = n; break }
+        }
+        guard let windowNumber, let statusBar = delegate.statusBar else {
+            expect(false, "helper app entered full screen")
+            finish()
+            return
+        }
+        await wait(1.5)   // let the Space transition finish
+        expect(helperOnScreen(windowNumber), "helper app is full screen and showing")
+
+        for (label, closeWindow) in [("SoundRouter window open", false), ("SoundRouter window closed", true)] {
+            if closeWindow { delegate.mainWindow?.performClose(nil); await wait(0.5) }
+            statusBar.toggle()   // what clicking the menu bar icon does
+            await wait(1.2)
+            let window = statusBar.popover.contentViewController?.view.window
+            let shown = statusBar.popover.isShown && window?.isVisible == true
+            let onSpace = window?.isOnActiveSpace == true
+            let stayed = helperOnScreen(windowNumber)
+            say("  \(label): panel shown=\(shown), on current Space=\(onSpace), still on full-screen app=\(stayed)")
+            expect(shown && onSpace && stayed, "\(label): menu bar panel opens over the full-screen app")
+            if statusBar.popover.isShown { statusBar.toggle() }
+            await wait(0.6)
+        }
+
+        process.terminate()
+        try? FileManager.default.removeItem(atPath: marker)
+        finish()
+
+        func finish() {
+            say(failures == 0 ? "ALL PASSED" : "\(failures) FAILURE(S)")
+            try? log.write(toFile: logPath, atomically: true, encoding: .utf8)
+            exit(failures == 0 ? 0 : 1)
+        }
+    }
+}

@@ -127,6 +127,7 @@ Run against the installed app. Launch through `open` so that macOS attributes th
 | `open -W -n ~/Applications/SoundRouter.app --args --selftest /tmp/self.log` | Devices, speaker volume, per-app routing (tap → speaker), app volume and mute, speaker sample-rate switches. Plays a short spoken clip. `SR_DEVICE=<name>` picks the target speaker. |
 | `open -W -n --env SR_SIMULATE_BT_HEADSET="<mic name>" ~/Applications/SoundRouter.app --args --mictest /tmp/mic.log` | Mic listing and levels, and the "keep headphones in high quality" setting, using the named mic as a stand-in headset. |
 | `open -W -n ~/Applications/SoundRouter.app --args --featuretest /tmp/feature.log` | Alerts speaker, presets, automations (by creating and removing a temporary virtual speaker), shortcuts, boost, balance, multi-speaker capture, multi-output devices, tab resampling. |
+| `swiftc Tests/fullscreen-helper.swift -o /tmp/fs-helper` then `open -W -n ~/Applications/SoundRouter.app --args --fullscreentest /tmp/fs.log /tmp/fs-helper` | The menu bar panel opens over a full-screen app (window open and closed) without switching Spaces. |
 | `…/SoundRouter --docktest /tmp/dock.log` | Closing the window hides the Dock icon; reopening from the menu bar restores it. |
 | `…/SoundRouter --menutest <dir>` | Opens the real menu bar panel and main window and saves light and dark screenshots. `SR_SECTION=apps\|speakers\|microphones\|settings`, `SR_EXPAND=<row id>`, `SR_LONG=1`. |
 

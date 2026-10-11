@@ -31,7 +31,12 @@ final class StatusBarController: NSObject {
             popover.performClose(nil)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            if let window = popover.contentViewController?.view.window {
+                // Without this the popover opens on the desktop Space, invisible over full-screen apps.
+                window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
+                window.orderFrontRegardless()
+                window.makeKey()
+            }
             NSApp.activate()
         }
     }
@@ -56,6 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         model.onShortcutsChanged = { MainActor.assumeIsolated { registerShortcuts() } }
         registerShortcuts()
+        if let i = CommandLine.arguments.firstIndex(of: "--fullscreentest"), CommandLine.arguments.indices.contains(i + 2) {
+            let (path, helper) = (CommandLine.arguments[i + 1], CommandLine.arguments[i + 2])
+            Task { @MainActor in try? await Task.sleep(for: .seconds(1)); await FullScreenTest.run(path, helper: helper, delegate: self) }
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--featuretest"), CommandLine.arguments.indices.contains(i + 1) {
             let path = CommandLine.arguments[i + 1]
             Task { @MainActor in try? await Task.sleep(for: .seconds(1.5)); await FeatureTest.run(path) }
