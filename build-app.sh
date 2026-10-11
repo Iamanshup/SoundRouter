@@ -4,7 +4,7 @@
 #   INSTALL=0    only build build/SoundRouter.app, don't install it
 set -e
 cd "$(dirname "$0")"
-VERSION=1.1
+VERSION=1.1.1
 APP=build/SoundRouter.app
 
 if [[ "$UNIVERSAL" == 1 ]]; then
