@@ -32,6 +32,16 @@ A macOS menu bar app that sends each app's sound, or even a single browser tab, 
 - Swift 6 toolchain: Xcode or just the Command Line Tools (`xcode-select --install`)
 - For per-tab routing: a Chromium browser (Chrome, Brave, Edge). Safari and Firefox don't let extensions capture tab audio.
 
+## Install
+
+With [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask iamanshup/tap/soundrouter
+```
+
+Or download the DMG from the [latest release](https://github.com/Iamanshup/SoundRouter/releases/latest). Either way, SoundRouter isn't notarized by Apple, so the first time you open it, go to **System Settings › Privacy & Security** and click **Open Anyway** (once).
+
 ## Build and install
 
 ```sh
@@ -51,6 +61,8 @@ Options: `UNIVERSAL=1` builds for both Apple Silicon and Intel; `INSTALL=0` buil
 ```sh
 ./make-dmg.sh        # → dist/SoundRouter-<version>.dmg (universal app + Applications link + Read Me)
 ```
+
+After publishing a release, update the Homebrew cask in [Iamanshup/homebrew-tap](https://github.com/Iamanshup/homebrew-tap) (`Casks/soundrouter.rb`) with the new `version` and the `sha256` that `make-dmg.sh` prints.
 
 The app is signed ad hoc, not notarized (that needs a paid Apple Developer account). On another Mac, the first launch shows "Apple could not verify SoundRouter"; open **System Settings › Privacy & Security** and click **Open Anyway** once. The DMG's *Read Me First.txt* explains this.
 

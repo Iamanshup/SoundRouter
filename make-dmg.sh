@@ -46,3 +46,6 @@ DMG="dist/SoundRouter-$VERSION.dmg"
 rm -f "$DMG"
 hdiutil create -volname "SoundRouter $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 echo "Created $DMG"
+echo "For the Homebrew cask (Iamanshup/homebrew-tap, Casks/soundrouter.rb):"
+echo "  version \"$VERSION\""
+echo "  sha256 \"$(shasum -a 256 "$DMG" | cut -d' ' -f1)\""
